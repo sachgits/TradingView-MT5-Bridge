@@ -1,449 +1,318 @@
-# TradingView to MT5 Trade Bridge
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import tkinter as tk
+from tkinter import scrolledtext
+import threading
+from datetime import datetime
+import os
+import json
+from pathlib import Path
+import time
 
-**FREE & Open Source** - Automated trading system that detects trades from TradingView Strategy Tester and executes them on MetaTrader 5 (MT5) via **HTTP bridge** or **File I/O** in real-time.
+app = Flask(__name__)
+CORS(app)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
-[![MT5](https://img.shields.io/badge/MT5-Compatible-green.svg)](https://www.metatrader5.com/)
-[![Status](https://img.shields.io/badge/Status-Active-success.svg)](https://github.com/niiisho/TradingView-MT5-Bridge)
+# Configuration
+SIGNALS_FOLDER = r"C:\Trades\signals"  # User configurable path
+CHECK_INTERVAL = 2  # seconds between folder checks
 
----
-
-## ⚠️ RISK WARNING — READ BEFORE USE
-
-This software executes real trades on your broker account automatically. Automated trading carries significant financial risk. You can lose your entire account balance, including amounts beyond your initial investment.
-
-- The author is NOT responsible for any financial losses, account liquidations, margin calls, or damages of any kind resulting from use of this software.
-- This is NOT financial advice and NOT a trading strategy. It is a technical automation tool only.
-- Past performance in TradingView's Strategy Tester does NOT guarantee future results on a live account.
-- Slippage, broker requotes, network latency, and platform outages can cause execution to differ significantly from what the backtester shows.
-- Verify that automated/algorithmic trading is permitted by your broker's Terms of Service before use.
-- Always test on a demo account first. Even after demo testing, live results may differ substantially.
-
-By using this software, you accept full and sole responsibility for all trading decisions and their financial consequences.
-
----
-
-## 🌟 Why This Project is Different
-
-### ✨ **ABSOLUTELY FREE - NO TRADINGVIEW PREMIUM NEEDED!**
-
-**Unlike paid solutions requiring:**
-- ❌ TradingView Premium webhooks
-- ❌ Cloud VPS ($10-50/month)
-- ❌ Complex integrations
-
-**This is:**
-- ✅ **100% FREE** - No subscriptions
-- ✅ **Multiple Input Methods** - TradingView Chrome Extension OR File I/O
-- ✅ **Lightning Fast** - <500ms latency (Chrome) or ~2.75s (File I/O)
-- ✅ **Tiny Memory ~45MB** - Minimal resource usage
-- ✅ **Production Ready** - Waitress WSGI server
-- ✅ **Smart Protection** - Refresh and Rapid Trades Safe
-- ✅ **Flexible** - Works with any signal source
-
----
-
-## 📖 How It Works
-
-### **Option 1: TradingView Chrome Extension (Fast)**
-
-```
-TradingView Strategy Tester
-         ↓
-   Chrome Extension Detects
-         ↓ HTTP POST
-   localhost:8080 
-         ↓ JSON Poll
-   MT5 WebRequest EA Executes
-         ↓
-✅ Trade on Your Broker
-```
-
-**Total Latency:** **<500ms** end-to-end!
-
----
-
-### **Option 2: File I/O Mode (Flexible)**
-
-```
-Your Signal Source (Bot/Webhook/Script)
-         ↓
-   Write JSON to C:\Trades\signals\
-         ↓ (checks every 2 seconds)
-   Bridge detects file
-         ↓ JSON Poll
-   MT5 WebRequest EA Executes
-         ↓
-✅ Trade on Your Broker
-```
-
-**Total Latency:** **~2.75 seconds** end-to-end!
-
-**Perfect for:**
-- Custom trading bots
-- Non-TradingView signal sources
-- Webhook integrations
-- Testing and automation
-
-👉 **See [FILE_IO_GUIDE.md](FILE_IO_GUIDE.md) for File I/O setup and examples**
-
----
-
-## Installation & Setup Video
-- 3-minute full Installation & Setup Video of Trading-MT5-Bridge to automate Trades with Live Trade Example:
-  https://youtu.be/Op9VwIgxM8o
-
----
-
-## 🎯 Features
-
-- **Dual Input Methods** - TradingView Chrome Extension OR JSON File I/O  
-- **Real-time Detection** - Monitors TradingView trades list (Extension) or folder (File I/O)
-- **Automatic Signal Extraction** - Extracts BUY/SELL signals with SL/TP/LOT parameters 
-- **HTTP Bridge** - localhost:8080 API for all modes
-- **Signal Rejection** - Prevents overwrites during processing    
-- **Smart Filtering** - Ignores refresh/false signals  
-- **Robust Recovery** - Auto-reconnects on tab close  
-- **Clean UI** - Real-time logging dashboard  
-- **Backward Compatible** - Both HTTP and File modes work simultaneously
-
----
-
-## 📋 Requirements
-
-- **Windows OS** (MT5)
-- **MetaTrader 5**
-- **TradingView** Free account (no premium needed!)
-- **Python 3.8+** (if running from source)
-- **Broker permission** — Confirm your broker's Terms of Service allows automated/algorithmic trading before live use
-
-**For TradingView Chrome Extension mode:**
-- Chrome browser
-
-**For File I/O mode:**
-- Any process that can write JSON files (Python, C#, Node.js, webhooks, etc.)
-
----
-
-## 🛠️ Installation
-
-### **Quick Start (Pre-built EXE)**
-
-#### **1. TradingBridge.exe**
-1. Run `TradingBridge.exe`
-2. ✅ Click "Allow access" when Windows asks
-3. ✅ If Blocked: Windows Defender → Allow through firewall
-
-#### **2. Choose Your Mode**
-
-**🔹 Mode A: TradingView Chrome Extension (Recommended for TradingView users)**
-
-1. Chrome → `chrome://extensions/` → **Developer mode**
-2. **Load unpacked** → Select `Tradingview_Trade_Detector-Extension` folder
-3. ✅ Extension ready!
-4. Open TradingView → Strategy Tester → Click **List of Trades** tab
-5. Click **View Site Information** → Allow **Local Network Access**
-
-**🔹 Mode B: File I/O (Recommended for custom bots)**
-
-1. Files are automatically written to: `C:\Trades\signals\`
-2. No additional setup needed!
-3. See [FILE_IO_GUIDE.md](FILE_IO_GUIDE.md) for examples
-
-#### **3. MT5 EA Setup (Same for both modes)**
-1. Move `Trading_Bot` Folder to:
-```
-C:\Users\YourUsername\AppData\Roaming\MetaTrader 5\MQL5\Experts\
-```
-2. **Add URL:** In MT5 → Tools → Options → Expert Advisors → `http://127.0.0.1:8080`
-3. Attach EA to chart → Tick **Allow Algo Trading**
-4. Enable **Algo Trading** (Green) → Button on Top Row
-
----
-
-## 🚀 Usage
-
-### **TradingView Chrome Extension Mode**
-
-1. Start `TradingBridge.exe` - ✅ Shows: localhost:8080 running
-2. Load Chrome extension
-3. Open TradingView → Strategy Tester → **List of Trades**
-4. Open MT5 → **Attach EA** to any chart  
-5. ✅ **Automation active!**  
-6. ⚠️ **Important:** Keep TradingView tab visible (extension needs it active)
-
-### **File I/O Mode**
-
-1. Start `TradingBridge.exe`
-2. Drop JSON files into `C:\Trades\signals\` folder
-3. Bridge automatically processes files and sends to MT5
-4. Check dashboard logs for execution confirmation
-
-**Example signal file:**
-```json
-{
-  "signal": "BUY SL=50 TP=100 LOT=0.01",
-  "timestamp": "2025-09-16T14:30:45Z"
+# Store signal with status flag
+current_signal = {
+    "signal": "NONE",
+    "timestamp": "",
+    "status": "PROCESSED",
+    "source": "none"  # "http", "file", or "none"
 }
-```
 
-👉 **Full examples in [FILE_IO_GUIDE.md](FILE_IO_GUIDE.md)**
+log_widget = None
 
----
+def log(msg):
+    """Add message to GUI"""
+    if log_widget:
+        time_str = datetime.now().strftime("%H:%M:%S")
+        log_widget.insert(tk.END, f"[{time_str}] {msg}\n")
+        log_widget.see(tk.END)
+    print(msg)
 
-### TradingView Pine Script Setup (Optional)
 
-#### For Variable SL/TP/LOT:
+def clear_signal_manual():
+    """Manual clear button"""
+    global current_signal
+    current_signal = {
+        "signal": "NONE",
+        "timestamp": "",
+        "status": "PROCESSED",
+        "source": "none"
+    }
+    log(f"✅ Signal manually cleared!")
 
-Add this code to your Pine Script strategy to send **dynamic SL/TP/LOT** values:
 
-**Entry name format required:**
-```
-"BUY SL=<value> TP=<value> LOT=<value>"
-"SELL SL=<value> TP=<value> LOT=<value>"
-```
-
-**Example implementation:**
-
-```pine
-// In your Long entry logic:
-if (buyCondition)
-    // Calculate your SL/TP/LOT dynamically
-    sl_pips = math.round((entry - stop_loss) / pipsize)
-    tp_pips = math.round((take_profit - entry) / pipsize)
-    lot_size = calculated_lot_size
+def watch_signals_folder():
+    """Monitor folder for new JSON signal files
     
-    // Format entry name with SL/TP/LOT
-    entry_name = " BUY SL=" + str.tostring(sl_pips) + " TP=" + str.tostring(tp_pips) + " LOT=" + str.tostring(lot_size) + " "
+    Watches SIGNALS_FOLDER for *.json files containing trade signals.
+    Files should contain:
+    {
+        "signal": "BUY SL=50 TP=100 LOT=0.01",
+        "timestamp": "2025-09-16T14:30:45Z"
+    }
     
-    strategy.entry(entry_name, strategy.long, qty=lot_size)
-```
+    Files are processed in order of creation and deleted after processing.
+    """
+    global current_signal
+    
+    processed_files = set()
+    
+    while True:
+        try:
+            # Ensure folder exists
+            if not os.path.exists(SIGNALS_FOLDER):
+                time.sleep(CHECK_INTERVAL)
+                continue
+            
+            # Find all JSON files in folder, sorted by creation time (oldest first)
+            json_files = sorted(
+                Path(SIGNALS_FOLDER).glob("*.json"),
+                key=lambda f: f.stat().st_ctime
+            )
+            
+            for json_file in json_files:
+                file_key = str(json_file)
+                
+                # Skip already processed files
+                if file_key in processed_files:
+                    continue
+                
+                try:
+                    # Read JSON file
+                    with open(json_file, 'r') as f:
+                        data = json.load(f)
+                    
+                    # Extract signal from JSON
+                    signal_value = data.get('signal', 'NONE')
+                    
+                    # Validate signal
+                    if not signal_value or signal_value == 'NONE':
+                        log(f"⚠️ SKIPPED: {json_file.name} - invalid or empty signal")
+                        processed_files.add(file_key)
+                        try:
+                            os.remove(json_file)
+                        except:
+                            pass
+                        continue
+                    
+                    # Check if previous signal is still pending
+                    if current_signal["status"] == "NEW":
+                        log(f"⚠️ QUEUED: '{json_file.name}' - waiting for previous signal to complete")
+                        # Don't mark as processed yet; retry next iteration
+                        continue
+                    
+                    # Set new signal from file
+                    current_signal = {
+                        "signal": signal_value,
+                        "timestamp": datetime.now().isoformat(),
+                        "status": "NEW",
+                        "source": "file",
+                        "source_file": json_file.name
+                    }
+                    
+                    log(f"📊 NEW Signal from '{json_file.name}': {signal_value}")
+                    
+                    # Mark as processed
+                    processed_files.add(file_key)
+                    
+                    # Delete file after successful processing
+                    try:
+                        os.remove(json_file)
+                        log(f"✅ Processed and deleted {json_file.name}")
+                    except Exception as e:
+                        log(f"⚠️ Could not delete {json_file.name}: {e}")
+                    
+                except json.JSONDecodeError as e:
+                    log(f"❌ INVALID JSON in {json_file.name}: {e}")
+                    processed_files.add(file_key)
+                    try:
+                        os.remove(json_file)
+                    except:
+                        pass
+                except Exception as e:
+                    log(f"❌ ERROR reading {json_file.name}: {e}")
+                
+        except Exception as e:
+            log(f"❌ Watcher error: {e}")
+        
+        time.sleep(CHECK_INTERVAL)
+
+
+@app.route('/signal', methods=['GET'])
+def get_signal():
+    """MT5 reads from here
+    
+    Returns current signal in JSON format:
+    {
+        "signal": "BUY SL=50 TP=100 LOT=0.01",
+        "timestamp": "2025-09-16T14:30:45Z",
+        "status": "NEW" or "PROCESSED",
+        "source": "http" or "file"
+    }
+    """
+    return jsonify(current_signal)
+
 
-Similarly in your Short Entry Logic  
-**Values should be in PIPS** (not price levels).
-
-
-#### Without Variable SL/TP/LOT:
-
-If you don't modify your strategy  
-The MT5 EA will use **default values** from inputs.
-
-
----
-
-## 📊 Signal Format
-
-```
-Full: "BUY SL=50 TP=100 LOT=0.01"
-Simple: "BUY" or "SELL"
-Fallback: "long"→BUY, "short"→SELL
-```
-
----
-
-## 📁 Structure
-
-```
-tradingview-mt5-bridge/
-├── TradingBridge.exe                              # HTTP server (pre-built)
-├── Trading_Bridge_Source/                         # Python source for the server
-│   └── bridge.py                                  # Updated with File I/O support
-├── Trading_Bot/                                   # MT5 EA
-│   ├── Trading_Bot.mq5
-│   └── Trading_Bot.ex5
-├── Tradingview_Trade_Detector-Extension/          # Chrome extension (optional)
-│   ├── manifest.json
-│   ├── content.js
-│   ├── logger.html
-│   └── logger.js
-├── FILE_IO_GUIDE.md                              # Complete File I/O documentation
-├── README.md
-├── DISCLAIMER.md
-└── LICENSE
-```
-
----
-
-## 🔧 Troubleshooting
-
-### **TradingView Chrome Extension Mode**
-
-**Extension not detecting trades:**
-- Refresh TradingView page
-- Verify "List of Trades" tab is open
-
-**Server errors:**
-
-❌ "Port 8080 already in use"   →  Close other apps using port 8080  
-❌ "Server offline"      →   Restart TradingBridge.exe  
-❌ "WebRequest error"     →   Add http://127.0.0.1:8080 to MT5 → Tools → Options
-
-**MT5 not trading:**
-
-❌ AutoTrading red? → Click to enable (green)  
-❌ Experts tab errors? → Check logs  
-❌ Broker restrictions? → Test demo account  
-
-**Rejected/False signals:**
-
-✅ Extension ignores TradingView refresh  
-✅ Server rejects pending signals  
-✅ If Server **Rejecting Legit Trades** - Try `Clear Old Signal` button    
-✅ EA checks existing positions  
-✅ No Multiple Trades - Only 1 at a Time Allowed  
-
-### **File I/O Mode**
-
-👉 See [FILE_IO_GUIDE.md - Troubleshooting](FILE_IO_GUIDE.md#troubleshooting) for detailed solutions
-
-**Quick fixes:**
-- Verify JSON syntax (use online validator)
-- Check `C:\Trades\signals\` folder exists
-- Ensure folder has write permissions
-- Check TradingBridge GUI logs for errors
-
----
-
-## ⚙️ Configuration
-
-### **MT5 EA Inputs:**
-```
-LotSize=0.01
-StopLossPoints=50
-TakeProfitPoints=100
-MagicNumber=12345
-ServerURL=http://127.0.0.1:8080/signal
-```
-
-### **Bridge Server (bridge.py):**
-
-For File I/O mode, edit `bridge.py` to change folder path:
-```python
-SIGNALS_FOLDER = r"C:\Trades\signals"  # Change this line
-CHECK_INTERVAL = 2  # Check every 2 seconds (change for faster/slower)
-```
-
----
-
-## ❓ FAQ
-
-**Q: Does this work with live trading?**
-A: It can connect to a live account technically. However, all financial losses on live accounts are entirely your responsibility. Do not use on a live account until you have tested thoroughly on a demo account first.
-
-**Q: Can I modify SL/TP after trade opens?**
-A: Yes, but it's recommended to modify before attaching to chart.
-
-**Q: Multiple strategies same time?**
-A: One instance per symbol recommended.
-
-**Q: Can I use both Chrome Extension and File I/O at the same time?**
-A: Yes! Both methods can run simultaneously. They share the same signal queue, so use whichever is most convenient.
-
-**Q: How do I switch between modes?**
-A: Both modes run automatically. Keep the Chrome extension loaded for Chrome mode, and drop JSON files in the folder for File I/O mode.
-
-**Q: What's the latency difference?**
-A: Chrome Extension: <500ms | File I/O: ~2.75 seconds
-
----
-
-## 🔒 Security
-
-✅ **100% Local** - localhost only   
-✅ **No cloud** - No external servers  
-✅ **Open Source** - Full transparency  
-✅ **No API Keys** - No third-party services  
-✅ **Your Credentials** - Stay on your machine only  
-
----
-
-## ⚠️ Disclaimer and Legal Notice
-
-This software is provided for educational and personal use only. It is a technical bridge tool and does not constitute financial advice, investment advice, or a recommendation to trade any financial instrument.
-
-**Financial Risk:** Automated trading involves substantial risk of financial loss. You may lose more than your initial investment. The author, contributors, and distributors of this software bear no responsibility for any financial consequences resulting from its use.
-
-**No Warranty:** This software is provided "as is" without any warranty of any kind, express or implied. There is no guarantee of accuracy, reliability, fitness for a particular purpose, or uninterrupted operation.
-
-**Not Financial Advice:** Nothing in this software, its documentation, or any associated communications constitutes financial advice. All trading decisions are solely your own responsibility.
-
-**Regulatory Compliance:** It is your responsibility to ensure that your use of automated trading software complies with applicable laws, regulations, and your broker's Terms of Service in your jurisdiction.
-
-**Backtesting vs Live Trading:** Results shown in TradingView's Strategy Tester do not guarantee identical results on a live account. Live markets involve spread, slippage, and execution conditions that differ substantially from backtesting environments.
-
-By downloading, installing, or using this software in any form, you acknowledge that you have read, understood, and agreed to this disclaimer in full.
-
----
-
-## 📈 Version History
-
-### v2.1.0 (File I/O Release)
-✅ Added File I/O mode with JSON signal support  
-✅ Implemented folder watcher for automatic signal detection  
-✅ Maintained backward compatibility with HTTP POST  
-✅ Added FILE_IO_GUIDE.md with comprehensive documentation  
-✅ Enhanced GUI to show active mode and watched folder  
-✅ Support for hybrid mode (Chrome Extension + File I/O simultaneously)
-
-### v2.0.1
-✅ Improved bridge server UI  
-✅ Bug fixes and stability improvements  
-✅ Python source code now included in repo  
-✅ Expanded disclaimer and risk documentation  
-
----
-
-## 📝 License
-
-**MIT License** - See LICENSE file for details.
-
-**Copyright © 2025 Nishant Prakash Garg. All rights reserved.**
-
-
-### Using This Project?
-
-✅ **FREE for personal/educational use**   
-✅ **Commercial use allowed** (with attribution)   
-⚠️ **MUST include** copyright notice and LICENSE file    
-
----
-
-## 🤝 Contributing
-
-Contributions welcome! Please:
-
-1. **Fork** the repository  
-2. **Create** a feature branch (`git checkout -b feature/AmazingFeature`)  
-3. **Commit** your changes (`git commit -m 'Add some AmazingFeature'`)  
-4. **Push** to the branch (`git push origin feature/AmazingFeature`)  
-5. **Open** a Pull Request
-
----
-
-## 📧 Support & Contact  
-
-**Issues & Questions:**
-- 🐛 Open an issue  
-- 💬 Check existing issues first 
-
-**Commercial Support:**   
-- 🛠️ Installation assistance  
-- 📞 Contact: contactme.ngone@gmail.com 
-
----
-
-## ⭐ Star History  
-
-If this project helped you, please **star the repository!**  
-
-It helps others discover this free alternative to paid services.  
-
----
-
-**Built with ❤️ by Nishant P.Garg**  
-
----
-
-### 🚨 Important Note
-This is an **independent project** and is **not affiliated** with TradingView, MetaQuotes, or MetaTrader 5.
+@app.route('/signal', methods=['POST'])
+def post_signal():
+    """Accept signals via HTTP POST (backward compatible)
+    
+    Request body:
+    {
+        "signal": "SELL"
+    }
+    """
+    global current_signal
+    data = request.json
+    signal_value = data.get('signal', 'NONE')
+    
+    # Check if signal is already pending
+    if current_signal["status"] == "NEW":
+        log(f"⚠️ REJECTED: '{signal_value}' - Previous signal still pending!")
+        return jsonify({"status": "rejected", "reason": "signal_pending"})
+    
+    # Set new signal from HTTP
+    current_signal = {
+        "signal": signal_value,
+        "timestamp": datetime.now().isoformat(),
+        "status": "NEW",
+        "source": "http"
+    }
+    
+    log(f"📊 NEW Signal (HTTP): {signal_value}")
+    return jsonify({"status": "success"})
+
+
+@app.route('/signal/processed', methods=['POST'])
+def mark_processed():
+    """MT5 calls this after executing trade"""
+    global current_signal
+    current_signal["status"] = "PROCESSED"
+    log(f"✅ Signal marked as PROCESSED")
+    return jsonify({"status": "success"})
+
+
+@app.route('/signal/clear', methods=['POST'])
+def clear_signal():
+    """Reset to NONE"""
+    global current_signal
+    current_signal = {
+        "signal": "NONE",
+        "timestamp": "",
+        "status": "PROCESSED",
+        "source": "none"
+    }
+    log("🗑️ Signal cleared")
+    return jsonify({"status": "success"})
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({"status": "running"})
+
+
+def run_production_server():
+    """Run production server with Waitress"""
+    try:
+        # Try to import waitress (production server)
+        from waitress import serve
+        log("🚀 Starting production server (Waitress)...")
+        serve(app, host='127.0.0.1', port=8080, threads=4)
+    except ImportError:
+        # Fallback to Flask dev server if waitress not installed
+        log("⚠️ Waitress not found, using development server")
+        log("⚠️ For production use: pip install waitress")
+        app.run(host='127.0.0.1', port=8080, debug=False, use_reloader=False)
+
+
+def create_gui():
+    global log_widget
+    
+    root = tk.Tk()
+    root.title("TradingBridge Server - File I/O Mode")
+    root.geometry("600x480")
+    
+    # Header
+    header = tk.Label(root, text="🚀 TradingView Bridge - File I/O Mode", 
+                      font=("Arial", 14, "bold"), 
+                      bg="#4CAF50", fg="white", pady=10)
+    header.pack(fill=tk.X)
+    
+    # Status
+    status = tk.Label(root, text="✅ Production Server Running on localhost:8080", 
+                      font=("Arial", 10), fg="green")
+    status.pack(pady=5)
+    
+    # Folder info
+    folder_info = tk.Label(root, text=f"📁 Watching: {SIGNALS_FOLDER}", 
+                          font=("Arial", 9), fg="blue", wraplength=550)
+    folder_info.pack(pady=2)
+    
+    # Mode indicator
+    mode_label = tk.Label(root, text="Mode: File I/O (+ HTTP fallback)", 
+                         font=("Arial", 9), fg="orange")
+    mode_label.pack(pady=2)
+    
+    # Clear button
+    clear_btn = tk.Button(root, 
+                         text="🗑️ Clear Old Signal", 
+                         command=clear_signal_manual,
+                         font=("Arial", 10, "bold"),
+                         bg="#FF6B6B", 
+                         fg="white",
+                         cursor="hand2",
+                         relief="raised",
+                         padx=20,
+                         pady=5)
+    clear_btn.pack(pady=5)
+    
+    # Instructions
+    info = tk.Label(root, text="Drop JSON files into the signals folder or POST to /signal", 
+                    font=("Arial", 9), fg="gray")
+    info.pack()
+    
+    # Log section
+    tk.Label(root, text="Signal Log:", font=("Arial", 9, "bold")).pack(pady=5)
+    
+    log_widget = scrolledtext.ScrolledText(root, height=16, 
+                                           font=("Courier", 9),
+                                           bg="#1e1e1e", fg="#00ff00")
+    log_widget.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
+    
+    # Initial messages
+    log("✅ Server started successfully!")
+    log("🔧 Production mode - No Flask warnings!")
+    log(f"👀 Watching folder: {SIGNALS_FOLDER}")
+    log("📡 Waiting for JSON signal files or HTTP POST requests...")
+    log("")
+    log("JSON file format:")
+    log('  {"signal": "BUY SL=50 TP=100 LOT=0.01"}')
+    
+    # Ensure signals folder exists
+    try:
+        os.makedirs(SIGNALS_FOLDER, exist_ok=True)
+        log(f"✅ Signals folder ready: {SIGNALS_FOLDER}")
+    except Exception as e:
+        log(f"❌ Could not create signals folder: {e}")
+    
+    # Start file watcher in background thread
+    watcher_thread = threading.Thread(target=watch_signals_folder, daemon=True)
+    watcher_thread.start()
+    
+    # Start server in background thread
+    server_thread = threading.Thread(target=run_production_server, daemon=True)
+    server_thread.start()
+    
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    print("WARNING: This software can execute live trades. Use at your own risk. See README for full disclaimer.")
+    create_gui()
