@@ -1,13 +1,10 @@
 //+---------------------------------------------------------------------+
-//| TradingView to MT5 Bridge - Trading Bot v5.1                        |
-//| Copyright 2025, Nishant Prakash Garg                                |
-//| https://github.com/niiisho/TradingView-MT5-Bridge                   |
-//| Licensed under MIT License                                          |
+//| TradingView to MT5 Bridge - Trading Bot v6.0                          |
+//| Universal command processor                                          |
 //+---------------------------------------------------------------------+
-
-#property copyright "Copyright 2025, Nishant Prakash Garg"
-#property link      "https://github.com/niiisho/TradingView-MT5-Bridge"
-#property version   "5.1"
+#property copyright "Copyright 2025"
+#property link      "https://github.com/sachgits/TradingView-MT5-Bridge"
+#property version   "6.0"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -16,285 +13,490 @@ input double LotSize = 0.01;
 input int TakeProfitPoints = 100;
 input int StopLossPoints = 50;
 input int MagicNumber = 12345;
+input int MaxPositions = 5;
 input string ServerURL = "http://127.0.0.1:8080/signal";
 input string ProcessedURL = "http://127.0.0.1:8080/signal/processed";
 
 CTrade trade;
 uint lastCheckTime = 0;
 
+struct DistanceSpec
+{
+   string unit;
+   double value;
+   int period;
+   string timeframe;
+   double multiplier;
+};
+
+struct TradeCommand
+{
+   string action;
+   string symbol;
+   double size;
+   DistanceSpec stopLoss;
+   DistanceSpec takeProfit;
+   bool hasBreakeven;
+   DistanceSpec breakevenTrigger;
+   DistanceSpec breakevenLockIn;
+   bool hasTrailing;
+   DistanceSpec trailingActivation;
+   DistanceSpec trailingDistance;
+   bool isLegacy;
+   int closePercent;
+};
+
 int OnInit()
 {
    trade.SetExpertMagicNumber(MagicNumber);
-   Print("✅ TradingBridge v5.1 Started");
+   Print("✅ TradingBridge v6.0 Started");
    Print("📡 Monitoring: ", ServerURL);
-   
-   // 🔥 CLEAR ANY OLD SIGNALS ON STARTUP
-   Print("🧹 Clearing any old signals on server...");
    ClearOldSignalsOnStartup();
-   
    return(INIT_SUCCEEDED);
 }
 
 void ClearOldSignalsOnStartup()
 {
-   // First, check if there's an old signal
-   string signal = "";
+   string signalJson = "";
    string status = "";
-   
-   if(GetSignalFromServer(signal, status))
+   if(GetSignalFromServer(signalJson, status))
    {
-      if(signal != "" && signal != "NONE")
+      if(signalJson != "" && signalJson != "NONE")
       {
-         Print("⚠️ Found old signal on server: ", signal, " (Status: ", status, ")");
-         Print("🔄 Marking it as PROCESSED to prevent execution...");
-         
-         // Mark it as processed
+         Print("⚠️ Found stale signal on server. Clearing it.");
          MarkSignalProcessed();
-         
-         Print("✅ Old signal cleared! Ready for new signals.");
       }
-      else
-      {
-         Print("✅ No old signals on server. Ready!");
-      }
-   }
-   else
-   {
-      Print("⚠️ Could not connect to server on startup");
-      Print("💡 Make sure TradingBridge.exe is running!");
    }
 }
 
 void OnTick()
 {
-    uint CheckIntervalMs = 750;
-    uint currentTime = GetTickCount();
-    
-    if(currentTime - lastCheckTime < CheckIntervalMs)
-        return;
-    
-    lastCheckTime = currentTime;
-    
-    // Get signal and status from server
-    string signal = "";
-    string status = "";
-    
-    if(GetSignalFromServer(signal, status))
-    {
-        // 🔥 ONLY execute if status is "NEW"
-        if(status == "NEW" && signal != "" && signal != "NONE")
-        {
-                Print("📊 NEW Signal detected: ", signal); 
-                ProcessAlert(signal);
-                MarkSignalProcessed();
-                Print("✅ Signal processed and marked as PROCESSED on server");
-         }  
-     }
+   uint checkIntervalMs = 750;
+   uint now = GetTickCount();
+   if(now - lastCheckTime < checkIntervalMs)
+      return;
+   lastCheckTime = now;
+
+   string signalJson = "";
+   string status = "";
+   if(GetSignalFromServer(signalJson, status))
+   {
+      if(status == "NEW" && signalJson != "" && signalJson != "NONE")
+      {
+         TradeCommand cmd;
+         if(ParseTradeCommand(signalJson, cmd))
+         {
+            Print("📊 Processing command: action=", cmd.action, " symbol=", cmd.symbol, " size=", cmd.size);
+            ExecuteTradeCommand(cmd);
+            MarkSignalProcessed();
+         }
+      }
+   }
 }
 
-
-bool GetSignalFromServer(string &signal, string &status)
+bool GetSignalFromServer(string &signalJson, string &status)
 {
-    char data[];
-    char result[];
-    string headers;
-    
-    int res = WebRequest("GET", ServerURL, "", NULL, 5000, 
-                         data, 0, result, headers);
-    
-    if(res == 200)
-    {
-        string json = CharArrayToString(result);
-        
-        // 🔥 Parse JSON to extract signal and status
-        signal = ParseJSONValue(json, "signal");
-        status = ParseJSONValue(json, "status");
-        
-        return true;
-    }
-    else if(res == -1)
-    {
-        Print("⚠️ WebRequest error!");
-        Print("⚠️ Add http://127.0.0.1:8080 to allowed URLs!");
-        Print("⚠️ Tools → Options → Expert Advisors → WebRequest");
-    }
-    else
-    {
-        Print("❌ Server error: ", res);
-    }
-    
-    return false;
+   char data[];
+   char result[];
+   string headers = "";
+   int res = WebRequest("GET", ServerURL, "", NULL, 5000, data, 0, result, headers);
+   if(res == 200)
+   {
+      signalJson = CharArrayToString(result);
+      status = JsonGetString(signalJson, "status");
+      if(status == "")
+         status = "NEW";
+      return true;
+   }
+   if(res == -1)
+      Print("⚠️ WebRequest error! Add localhost:8080 to MT5 allowed URLs.");
+   else
+      Print("❌ Server error: ", res);
+   return false;
 }
-
 
 void MarkSignalProcessed()
 {
-    char data[];
-    char result[];
-    string headers = "Content-Type: application/json\r\n";
-    
-    // Send POST request
-    int res = WebRequest("POST", ProcessedURL, headers, NULL, 5000, 
-                         data, 0, result, headers);
-    
-    if(res == -1)
-    {
-        Print("⚠️ Could not mark signal as Processed");
-    }
+   char data[];
+   char result[];
+   string headers = "Content-Type: application/json\r\n";
+   int res = WebRequest("POST", ProcessedURL, headers, NULL, 5000, data, 0, result, headers);
+   if(res == -1)
+      Print("⚠️ Could not mark signal as processed.");
 }
 
-
-string ParseJSONValue(string json, string key)
+bool ParseTradeCommand(string jsonText, TradeCommand &cmd)
 {
-    // Find: "key":"value" or "key": "value"
-    string searchKey = "\"" + key + "\":";
-    int startPos = StringFind(json, searchKey);
-    
-    if(startPos == -1)
-        return "";
-    
-    // Move past the key and colon
-    startPos = startPos + StringLen(searchKey);
-    
-    // Skip whitespace and find opening quote
-    int jsonLen = StringLen(json);
-    bool foundQuote = false;
-    
-    for(int i = startPos; i < jsonLen; i = i + 1)
-    {
-        string currentChar = StringSubstr(json, i, 1);
-        
-        if(currentChar == "\"")
-        {
-            startPos = i + 1;
-            foundQuote = true;
-            break;
-        }
-        
-        if(currentChar != " " && currentChar != "\t")
-        {
-            break;
-        }
-    }
-    
-    if(!foundQuote)
-        return "";
-    
-    // Find closing quote
-    int endPos = StringFind(json, "\"", startPos);
-    
-    if(endPos == -1)
-        return "";
-    
-    return StringSubstr(json, startPos, endPos - startPos);
+   cmd = NULL;
+   cmd.isLegacy = false;
+
+   if(StringFind(jsonText, "\"signal\"") >= 0)
+   {
+      string signalText = JsonGetString(jsonText, "signal");
+      if(signalText != "")
+      {
+         cmd.isLegacy = true;
+         return ParseLegacyCommand(signalText, cmd);
+      }
+   }
+
+   cmd.action = JsonGetString(jsonText, "action");
+   if(cmd.action == "")
+      return false;
+
+   cmd.symbol = JsonGetString(jsonText, "symbol");
+   if(cmd.symbol == "")
+      cmd.symbol = Symbol();
+
+   cmd.size = JsonGetDouble(jsonText, "size", LotSize);
+   if(cmd.size <= 0)
+      cmd.size = JsonGetDouble(jsonText, "lot", LotSize);
+   if(cmd.size <= 0)
+      cmd.size = JsonGetDouble(jsonText, "value", LotSize);
+
+   cmd.stopLoss = ParseDistanceSpec(jsonText, "stop_loss", "sl");
+   cmd.takeProfit = ParseDistanceSpec(jsonText, "take_profit", "tp");
+
+   if(cmd.stopLoss.value <= 0)
+      cmd.stopLoss = BuildDistanceSpec("points", JsonGetDouble(jsonText, "sl_distance", StopLossPoints));
+   if(cmd.takeProfit.value <= 0)
+      cmd.takeProfit = BuildDistanceSpec("points", JsonGetDouble(jsonText, "tp_distance", TakeProfitPoints));
+
+   cmd.hasBreakeven = false;
+   string breakevenObject = JsonGetObject(jsonText, "breakeven");
+   if(breakevenObject != "")
+   {
+      cmd.hasBreakeven = true;
+      cmd.breakevenTrigger = ParseDistanceSpecObject(breakevenObject, "trigger");
+      cmd.breakevenLockIn = ParseDistanceSpecObject(breakevenObject, "lock_in");
+      if(cmd.breakevenTrigger.value <= 0)
+         cmd.breakevenTrigger = BuildDistanceSpec("points", 100.0);
+      if(cmd.breakevenLockIn.value <= 0)
+         cmd.breakevenLockIn = BuildDistanceSpec("points", 20.0);
+   }
+
+   cmd.hasTrailing = false;
+   string trailingObject = JsonGetObject(jsonText, "trailing");
+   if(trailingObject != "")
+   {
+      cmd.hasTrailing = true;
+      cmd.trailingActivation = ParseDistanceSpecObject(trailingObject, "activation");
+      cmd.trailingDistance = ParseDistanceSpecObject(trailingObject, "distance");
+      if(cmd.trailingDistance.value <= 0)
+         cmd.trailingDistance = BuildDistanceSpec("points", 60.0);
+   }
+
+   cmd.closePercent = (int)JsonGetDouble(jsonText, "close_percent", 100.0);
+   return true;
 }
 
-
-void ProcessAlert(string alert)
+bool ParseLegacyCommand(string signalText, TradeCommand &cmd)
 {
-   if(PositionsTotal() > 0)
-   {
-      Print("⛔ ALREADY 1 TRADE OPEN - IGNORING SIGNAL");
-      return;
-   }
-   
-   int sl_pips = StopLossPoints;
-   int tp_pips = TakeProfitPoints;
-   double lot_size = LotSize;
-   
-   int sl_start = StringFind(alert, "SL=");
-   if(sl_start >= 0)
-   {
-      string sl_part = StringSubstr(alert, sl_start + 3);
-      int sl_end = StringFind(sl_part, " ");
-      if(sl_end < 0) sl_end = StringLen(sl_part);
-      string sl_str = StringSubstr(sl_part, 0, sl_end);
-      sl_pips = (int)StringToInteger(sl_str);
-   }
-   
-   int tp_start = StringFind(alert, "TP=");
-   if(tp_start >= 0)
-   {
-      string tp_part = StringSubstr(alert, tp_start + 3);
-      int tp_end = StringFind(tp_part, " ");
-      if(tp_end < 0) tp_end = StringLen(tp_part);
-      string tp_str = StringSubstr(tp_part, 0, tp_end);
-      tp_pips = (int)StringToInteger(tp_str);
-   }
-   
-   int lot_start = StringFind(alert, "LOT=");
-   if(lot_start >= 0)
-   {
-      string lot_part = StringSubstr(alert, lot_start + 4);
-      int lot_end = StringFind(lot_part, " ");
-      if(lot_end < 0) lot_end = StringLen(lot_part);
-      string lot_str = StringSubstr(lot_part, 0, lot_end);
-      lot_size = StringToDouble(lot_str);
-   }
-   
-   // ENFORCE LOT LIMITS
-   double min_lot = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN);
-   double max_lot = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX);
-   lot_size = MathMax(min_lot, MathMin(max_lot, lot_size));
+   cmd.action = "buy";
+   string text = StringUpper(signalText);
+   if(StringFind(text, "SELL") >= 0 || StringFind(text, "SHORT") >= 0)
+      cmd.action = "sell";
 
+   cmd.symbol = Symbol();
+   cmd.size = LotSize;
+   cmd.stopLoss = BuildDistanceSpec("points", StopLossPoints);
+   cmd.takeProfit = BuildDistanceSpec("points", TakeProfitPoints);
 
-   if(StringFind(alert, "BUY") >= 0)
+   int pos = StringFind(signalText, "SL=");
+   if(pos >= 0)
    {
-      OpenBuyOrder(Symbol(), lot_size, sl_pips, tp_pips);
-      return;
+      string remainder = StringSubstr(signalText, pos + 3);
+      int endPos = StringFind(remainder, " ");
+      if(endPos < 0) endPos = StringLen(remainder);
+      string value = StringSubstr(remainder, 0, endPos);
+      cmd.stopLoss.value = StringToDouble(value);
+      cmd.stopLoss.unit = "points";
    }
-   
-   if(StringFind(alert, "SELL") >= 0)
+
+   pos = StringFind(signalText, "TP=");
+   if(pos >= 0)
    {
-      OpenSellOrder(Symbol(), lot_size, sl_pips, tp_pips);
-      return;
+      string remainder = StringSubstr(signalText, pos + 3);
+      int endPos = StringFind(remainder, " ");
+      if(endPos < 0) endPos = StringLen(remainder);
+      string value = StringSubstr(remainder, 0, endPos);
+      cmd.takeProfit.value = StringToDouble(value);
+      cmd.takeProfit.unit = "points";
    }
+
+   pos = StringFind(signalText, "LOT=");
+   if(pos >= 0)
+   {
+      string remainder = StringSubstr(signalText, pos + 4);
+      int endPos = StringFind(remainder, " ");
+      if(endPos < 0) endPos = StringLen(remainder);
+      string value = StringSubstr(remainder, 0, endPos);
+      cmd.size = StringToDouble(value);
+   }
+
+   return true;
 }
 
-
-void OpenBuyOrder(string symbol, double lot, int sl_pips, int tp_pips)
+DistanceSpec ParseDistanceSpec(string jsonText, string fieldA, string fieldB)
 {
-   ClosePositionsByType(symbol, POSITION_TYPE_SELL);
-   
+   DistanceSpec out;
+   out.unit = "points";
+   out.value = 0;
+   out.period = 14;
+   out.timeframe = "M15";
+   out.multiplier = 1.0;
+
+   string object = JsonGetObject(jsonText, fieldA);
+   if(object == "")
+      object = JsonGetObject(jsonText, fieldB);
+   if(object != "")
+      return ParseDistanceSpecObject(object, "");
+
+   string value = JsonGetString(jsonText, fieldA);
+   if(value == "")
+      value = JsonGetString(jsonText, fieldB);
+   if(value != "")
+   {
+      out.value = StringToDouble(value);
+      return out;
+   }
+
+   return out;
+}
+
+DistanceSpec ParseDistanceSpecObject(string objectText, string key)
+{
+   DistanceSpec out;
+   out.unit = "points";
+   out.value = 0;
+   out.period = 14;
+   out.timeframe = "M15";
+   out.multiplier = 1.0;
+
+   if(key != "")
+   {
+      string nested = JsonGetObject(objectText, key);
+      if(nested != "")
+         objectText = nested;
+   }
+
+   out.unit = JsonGetString(objectText, "unit");
+   if(out.unit == "")
+      out.unit = "points";
+   out.value = JsonGetDouble(objectText, "value", 0.0);
+   if(out.value <= 0)
+      out.value = JsonGetDouble(objectText, "distance", 0.0);
+   out.multiplier = JsonGetDouble(objectText, "multiplier", 1.0);
+   out.period = (int)JsonGetDouble(objectText, "period", 14.0);
+   out.timeframe = JsonGetString(objectText, "timeframe");
+   if(out.timeframe == "")
+      out.timeframe = "M15";
+   return out;
+}
+
+DistanceSpec BuildDistanceSpec(string unit, double value)
+{
+   DistanceSpec out;
+   out.unit = unit;
+   out.value = value;
+   out.period = 14;
+   out.timeframe = "M15";
+   out.multiplier = 1.0;
+   return out;
+}
+
+void ExecuteTradeCommand(TradeCommand &cmd)
+{
+   if(PositionsTotal() >= MaxPositions)
+   {
+      Print("⛔ Maximum open positions reached. Ignoring command.");
+      return;
+   }
+
+   if(StringFind(cmd.action, "buy") >= 0)
+   {
+      OpenBuyOrder(cmd.symbol, cmd.size, cmd.stopLoss, cmd.takeProfit);
+      return;
+   }
+   if(StringFind(cmd.action, "sell") >= 0)
+   {
+      OpenSellOrder(cmd.symbol, cmd.size, cmd.stopLoss, cmd.takeProfit);
+      return;
+   }
+   if(cmd.action == "close_position")
+   {
+      ClosePositionByMagicAndSymbol(cmd.symbol, MagicNumber);
+      return;
+   }
+   if(cmd.action == "close_positions")
+   {
+      ClosePositionsBySymbol(cmd.symbol);
+      return;
+   }
+   Print("⚠️ Command action not implemented yet: ", cmd.action);
+}
+
+void OpenBuyOrder(string symbol, double lot, DistanceSpec sl, DistanceSpec tp)
+{
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double tp = ask + tp_pips * point;
-   double sl = ask - sl_pips * point;
-   
-   if(trade.Buy(lot, symbol, ask, sl, tp, "BUY"))
-      Print("✅ BUY OPENED! LOT=", lot, " SL=", sl_pips, " TP=", tp_pips);
+   int slPoints = ResolveDistanceToPoints(symbol, sl);
+   int tpPoints = ResolveDistanceToPoints(symbol, tp);
+   double slPrice = ask - slPoints * point;
+   double tpPrice = ask + tpPoints * point;
+
+   if(trade.Buy(lot, symbol, ask, slPrice, tpPrice, "BUY"))
+      Print("✅ BUY OPENED | symbol=", symbol, " lot=", lot, " sl=", slPoints, " tp=", tpPoints);
    else
       Print("❌ BUY FAILED: ", trade.ResultRetcode());
 }
 
-
-void OpenSellOrder(string symbol, double lot, int sl_pips, int tp_pips)
+void OpenSellOrder(string symbol, double lot, DistanceSpec sl, DistanceSpec tp)
 {
-   ClosePositionsByType(symbol, POSITION_TYPE_BUY);
-   
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double tp = bid - tp_pips * point;
-   double sl = bid + sl_pips * point;
-   
-   if(trade.Sell(lot, symbol, bid, sl, tp, "SELL"))
-      Print("✅ SELL OPENED! LOT=", lot, " SL=", sl_pips, " TP=", tp_pips);
+   int slPoints = ResolveDistanceToPoints(symbol, sl);
+   int tpPoints = ResolveDistanceToPoints(symbol, tp);
+   double slPrice = bid + slPoints * point;
+   double tpPrice = bid - tpPoints * point;
+
+   if(trade.Sell(lot, symbol, bid, slPrice, tpPrice, "SELL"))
+      Print("✅ SELL OPENED | symbol=", symbol, " lot=", lot, " sl=", slPoints, " tp=", tpPoints);
    else
       Print("❌ SELL FAILED: ", trade.ResultRetcode());
 }
 
-
-void ClosePositionsByType(string symbol, ENUM_POSITION_TYPE type)
+void ClosePositionByMagicAndSymbol(string symbol, int magic)
 {
    for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) && 
+      if(PositionSelectByTicket(ticket) &&
          PositionGetString(POSITION_SYMBOL) == symbol &&
-         PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
-         PositionGetInteger(POSITION_TYPE) == type)
+         PositionGetInteger(POSITION_MAGIC) == magic)
       {
          trade.PositionClose(ticket);
       }
    }
 }
+
+void ClosePositionsBySymbol(string symbol)
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket) && PositionGetString(POSITION_SYMBOL) == symbol)
+      {
+         trade.PositionClose(ticket);
+      }
+   }
+}
+
+int ResolveDistanceToPoints(string symbol, DistanceSpec spec)
+{
+   if(spec.value <= 0)
+      return 50;
+
+   if(spec.unit == "points")
+      return (int)MathRound(spec.value);
+   if(spec.unit == "price_distance")
+      return (int)MathRound(spec.value / SymbolInfoDouble(symbol, SYMBOL_POINT));
+   if(spec.unit == "atr")
+   {
+      int handle = iATR(symbol, PERIOD_M15, spec.period);
+      if(handle != INVALID_HANDLE)
+      {
+         double atr = iATR(symbol, PERIOD_M15, spec.period);
+         if(atr > 0)
+            return (int)MathRound((atr / SymbolInfoDouble(symbol, SYMBOL_POINT)) * spec.multiplier);
+      }
+   }
+   return 50;
+}
+
+string JsonGetString(string jsonText, string key)
+{
+   string needle = "\"" + key + "\"";
+   int pos = StringFind(jsonText, needle);
+   if(pos < 0)
+      return "";
+
+   pos = StringFind(jsonText, ":", pos);
+   if(pos < 0)
+      return "";
+   pos++;
+   while(pos < StringLen(jsonText))
+   {
+      string ch = StringSubstr(jsonText, pos, 1);
+      if(ch == " " || ch == "\n" || ch == "\r" || ch == "\t")
+      {
+         pos++;
+         continue;
+      }
+      break;
+   }
+
+   string ch = StringSubstr(jsonText, pos, 1);
+   if(ch == "\"")
+   {
+      pos++;
+      int end = StringFind(jsonText, "\"", pos);
+      if(end < 0)
+         return "";
+      return StringSubstr(jsonText, pos, end - pos);
+   }
+
+   int end = pos;
+   while(end < StringLen(jsonText))
+   {
+      string current = StringSubstr(jsonText, end, 1);
+      if(current == "," || current == "}" || current == "]")
+         break;
+      end++;
+   }
+   return StringSubstr(jsonText, pos, end - pos);
+}
+
+string JsonGetObject(string jsonText, string key)
+{
+   string needle = "\"" + key + "\"";
+   int pos = StringFind(jsonText, needle);
+   if(pos < 0)
+      return "";
+
+   int start = StringFind(jsonText, "{", pos);
+   if(start < 0)
+      return "";
+
+   int end = start + 1;
+   int depth = 1;
+   while(end < StringLen(jsonText) && depth > 0)
+   {
+      string ch = StringSubstr(jsonText, end, 1);
+      if(ch == "{") depth++;
+      if(ch == "}") depth--;
+      end++;
+   }
+   if(depth != 0)
+      return "";
+   return StringSubstr(jsonText, start, end - start);
+}
+
+double JsonGetDouble(string jsonText, string key, double defaultValue)
+{
+   string value = JsonGetString(jsonText, key);
+   if(value == "")
+      return defaultValue;
+   return StringToDouble(value);
+}
+
+
+
+
+
+
+
+
+
+
+
