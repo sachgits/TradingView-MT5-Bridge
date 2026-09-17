@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TradingBridge Trade Command v2",
+  "type": "object",
+  "required": ["action"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "request_id": {"type": "string"},
+    "timestamp": {"type": "string"},
+    "symbol": {"type": ["string", "null"]},
+    "action": {"enum": ["buy", "sell", "buy_limit", "sell_limit", "buy_stop", "sell_stop", "close_position", "close_positions", "partial_close", "modify_position", "reverse", "close_pending"]},
+    "size": {"type": ["number", "object"]},
+    "stop_loss": {"type": "object"},
+    "take_profit": {"type": "object"},
+    "take_profits": {"type": "array"},
+    "breakeven": {"type": "object"},
+    "trailing": {"type": "object"},
+    "risk": {"type": "object"},
+    "scope": {"type": "object"}
+  }
+}
