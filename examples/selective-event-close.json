@@ -1,0 +1,10 @@
+{
+  "request_id": "demo-event-close-001",
+  "timestamp": "2026-09-17T00:00:00Z",
+  "schema_version": "2.0",
+  "action": "close_positions",
+  "symbol": "EURUSD",
+  "strategy_id": "ROC_G8",
+  "reason": "high_impact_news",
+  "close_percent": 100
+}

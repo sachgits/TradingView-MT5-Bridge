@@ -1,0 +1,10 @@
+{
+  "request_id": "demo-fx-001",
+  "timestamp": "2026-09-17T00:00:00Z",
+  "schema_version": "2.0",
+  "symbol": "EURUSD",
+  "action": "buy",
+  "size": 0.01,
+  "stop_loss": {"unit": "points", "value": 200},
+  "take_profit": {"unit": "points", "value": 400}
+}

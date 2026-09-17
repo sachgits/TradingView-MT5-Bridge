@@ -1,0 +1,17 @@
+{
+  "request_id": "demo-rich-001",
+  "timestamp": "2026-09-17T00:00:00Z",
+  "schema_version": "2.0",
+  "symbol": "EURUSD",
+  "action": "buy",
+  "strategy_id": "ROC_G8",
+  "magic": 12345,
+  "size": {"type": "fixed", "unit": "lots", "value": 0.02},
+  "stop_loss": {"unit": "atr", "period": 14, "timeframe": "M15", "multiplier": 2.0},
+  "take_profits": [
+    {"distance": {"unit": "points", "value": 200}, "close_percent": 50},
+    {"distance": {"unit": "points", "value": 400}, "close_percent": 50}
+  ],
+  "breakeven": {"enabled": true, "trigger": {"unit": "points", "value": 150}, "lock_in": {"unit": "points", "value": 20}},
+  "trailing": {"enabled": true, "activation": {"unit": "points", "value": 250}, "distance": {"unit": "points", "value": 100}}
+}
