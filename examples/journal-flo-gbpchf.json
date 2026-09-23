@@ -1,0 +1,26 @@
+{
+  "id": "20260922T195825Z_FLO_GBPCHF_long",
+  "book": "FLO",
+  "playbook": "Flossbach Liquidation Sweep",
+  "tag": "FLO",
+  "pair": "GBPCHF",
+  "direction": "long",
+  "tier": "solid",
+  "status": "triggered_active",
+  "setup": {
+    "entry": 1.09556,
+    "stop": 1.09335,
+    "target": 1.09998
+  },
+  "sizing": {
+    "lots": 0.02,
+    "pip_distance": 22.1
+  },
+  "management": {
+    "atr_context": null,
+    "breakeven": {
+      "applicable": true,
+      "trigger_r": 1.0
+    }
+  }
+}

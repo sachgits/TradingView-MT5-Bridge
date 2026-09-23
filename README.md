@@ -1,318 +1,188 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import tkinter as tk
-from tkinter import scrolledtext
-import threading
-from datetime import datetime
-import os
-import json
-from pathlib import Path
-import time
+# TradingView to MT5 Trade Bridge
 
-app = Flask(__name__)
-CORS(app)
+**FREE & Open Source** - Automated trading system that detects trades from TradingView Strategy Tester (or any JSON producer) and executes them on MetaTrader 5 through the **Bot_Trader** EA, with a full audit ledger and a live **signal board** in your browser.
 
-# Configuration
-SIGNALS_FOLDER = r"C:\Trades\signals"  # User configurable path
-CHECK_INTERVAL = 2  # seconds between folder checks
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
+[![MT5](https://img.shields.io/badge/MT5-Bot__Trader__v6.5-green.svg)](https://www.metatrader5.com/)
 
-# Store signal with status flag
-current_signal = {
-    "signal": "NONE",
-    "timestamp": "",
-    "status": "PROCESSED",
-    "source": "none"  # "http", "file", or "none"
+---
+
+## ⚠️ RISK WARNING — READ BEFORE USE
+
+This software executes real trades on your broker account automatically. Automated trading carries significant financial risk. You can lose your entire account balance, including amounts beyond your initial investment.
+
+- The author is NOT responsible for any financial losses, account liquidations, margin calls, or damages of any kind resulting from use of this software.
+- This is NOT financial advice and NOT a trading strategy. It is a technical automation tool only.
+- Past performance in TradingView's Strategy Tester does NOT guarantee future results on a live account.
+- Slippage, broker requotes, network latency, and platform outages can cause execution to differ significantly from what the backtester shows.
+- Verify that automated/algorithmic trading is permitted by your broker's Terms of Service before use.
+- Always test on a demo account first. Even after demo testing, live results may differ substantially.
+
+By using this software, you accept full and sole responsibility for all trading decisions and their financial consequences.
+
+---
+
+## 🌟 Why This Project is Different
+
+- ✅ **100% FREE** - no TradingView Premium, no webhooks, no cloud VPS, no subscription
+- ✅ **Three input methods** - Chrome extension, HTTP API, or JSON files dropped in a folder
+- ✅ **A signal board, not a log window** - every command, dispatch, acknowledgement, retcode and latency figure is stored in a SQLite ledger and streamed to `http://127.0.0.1:8080/`
+- ✅ **Idempotent by design** - a command is never dispatched twice, even across a bridge restart
+- ✅ **Auditable file intake** - the signal folder is read-only: files are copied into the bridge's own data folder and the copy is marked `.processed` / `.rejected` / `.invalid`. Nothing in the shared folder is renamed or deleted, and you can point the bridge at a different folder from the board without restarting
+- ✅ **Production server** - Waitress WSGI, thread-safe queue, bounded SSE streams
+
+---
+
+## 📖 How It Works
+
+```
+TradingView Strategy Tester ──▶ Chrome extension ──┐
+Any bot / webhook / script  ──▶ JSON file in inbox ─┤──▶ TradingBridge (localhost:8080)
+Operator or test harness    ──▶ HTTP API ───────────┘      │  read inbox (never write to it)
+                                                           │  copy → normalize → validate → queue
+                                                           │  SQLite ledger + event bus
+                                                           │  signal board (SSE)
+                                                    MT5 Bot_Trader EA polls GET /signal
+                                                           │  executes, POSTs the outcome
+                                                    ◀──────┘  board shows the result per trade
+```
+
+Two folders are involved and they are not interchangeable: the **inbox** holds
+commands from you and any other application and is read-only as far as the bridge
+is concerned, while the **data folder** is the bridge's own and holds the ledger
+plus a marked copy of every file it consumed. The inbox is the one path you can
+change while the bridge runs - it is a field on the board's Settings tab - and
+whatever is already in a folder you switch to is adopted rather than traded.
+
+Every command that enters the bridge gets a `request_id` and a ledger row. The EA polls for the oldest queued command, executes it, and posts the outcome (status, retcode, result text) back. The board ties the two together: one row per trade, with its dispatch time, acknowledgement, retcode meaning and full event timeline.
+
+---
+
+## 🛠️ Installation
+
+### 1. TradingBridge
+
+- **Pre-built:** run `Trading_Bridge.exe`, allow network access.
+- **From source:** `python Trading_Bridge_Source/run_bridge.py` (add `--no-gui` for headless, `--port`, `--host`, `--folder`, `--data` to override).
+
+Then open **http://127.0.0.1:8080/** - that is the signal board.
+
+### 2. Choose your input method
+
+**🔹 Chrome extension (TradingView users)**
+1. Chrome → `chrome://extensions/` → enable **Developer mode**
+2. **Load unpacked** → select `Tradingview_Trade_Detector-Extension`
+3. Open TradingView → Strategy Tester → **List of Trades**
+4. Site settings → allow **Local Network Access** for tradingview.com
+
+**🔹 JSON files (custom bots)**
+1. Write commands to the inbox (default `C:\Trades\signals`). It is **read-only** to the bridge: your files are never renamed, marked or deleted
+2. Each one is copied into the data folder (default `C:\Trades\TradingBridge\intake`) and the copy is marked `.processed`, `.rejected`, `.invalid` or `.interrupted`
+3. What has already been consumed is remembered in the ledger, so a file left in the inbox cannot produce a second trade
+4. See [FILE_IO_GUIDE.md](FILE_IO_GUIDE.md)
+
+**🔹 HTTP API** - `POST /api/v1/signals` with any command Bot_Trader accepts (see below).
+
+### 3. MT5 EA setup
+
+1. Copy the `Bot_Trader` folder to `C:\Users\<you>\AppData\Roaming\MetaTrader 5\MQL5\Experts\`
+   (`Trading_Bot` is kept as an identical second copy; compile either in MetaEditor)
+2. MT5 → Tools → Options → Expert Advisors → add `http://127.0.0.1:8080` to the allow-list
+3. Attach the EA to a chart, tick **Allow Algo Trading**, and enable the Algo Trading button
+
+---
+
+## 🧭 The signal board
+
+| Tab | What it shows |
+|---|---|
+| **Board** | KPI cards (total / executed / failed / skipped / waiting / rejected / expired), throughput chart, outcome mix, by-symbol and by-action bars, latency percentiles, retcode histogram, live event feed |
+| **Signals** | The full ledger with search and status/symbol/action filters; click a row for the detail drawer with the command, the raw payload, the EA's acknowledgement and the event timeline |
+| **Events** | Every event the bridge emitted, newest first, with follow-along scrolling |
+| **Send** | Compose a command, validate it dry-run (same checks as a real submission, writes nothing), preview the exact envelope the EA will receive, then send |
+| **Settings** | Watch interval, file settle time, intake on/off, validation mode, queue depth, signal TTL, dedup window, dispatch timeout, pause, origin check - saved and applied live |
+| **EA contract** | What Bot_Trader v6.5 actually implements: executed actions, skipped actions, size and distance units, inputs, envelope keys, retcode tables |
+
+The board updates over Server-Sent Events. If a stream cannot be opened (too many tabs, or a proxy that buffers), it falls back to polling automatically - every event is durable in the ledger either way, so nothing is missed.
+
+Top-bar controls: **Pause dispatch** (the EA keeps polling but receives nothing), **Scan folder** (immediate intake pass), **Clear queue** (cancel everything not yet sent).
+
+---
+
+## 📐 Command vocabulary (schema v2.1)
+
+Anything Bot_Trader v6.5 accepts is accepted here. Legacy plain-text signals (`BUY SL=50 TP=100 LOT=0.01`) and `{"signal": "..."}` envelopes still work and are flagged as legacy on the board.
+
+```json
+{
+  "action": "buy",
+  "symbol": "EURUSD",
+  "size": { "value": 0.01, "unit": "lots" },
+  "stop_loss": { "unit": "points", "value": 200 },
+  "take_profit": { "unit": "points", "value": 400 }
 }
+```
 
-log_widget = None
+- **Actions:** `buy`, `sell`, `close_position`, `close_all`, `partial_close`, `modify`, `breakeven`, `hold`
+- **Size:** `lots`, `percent`, `risk_percent`-style risk sizing via `risk_percent`; units the EA cannot honour exactly are reported as warnings, never guessed
+- **Distances:** `points`, `pips`, `price_distance`, `price`, `atr` (ATR timeframe is parsed but the EA uses its chart timeframe - flagged as a warning)
+- **Aliases** accepted and canonicalized: `lot`/`volume`/`qty`, `sl`/`stoploss`, `tp`/`takeprofit`, and legacy keyword text
 
-def log(msg):
-    """Add message to GUI"""
-    if log_widget:
-        time_str = datetime.now().strftime("%H:%M:%S")
-        log_widget.insert(tk.END, f"[{time_str}] {msg}\n")
-        log_widget.see(tk.END)
-    print(msg)
+The bridge **never invents a trade parameter**. If a size, symbol or stop is missing where the EA would substitute its own input, strict validation refuses the command instead of letting the EA guess.
 
+Full field reference: [AUDIT_AND_COMMANDS.md](AUDIT_AND_COMMANDS.md).
 
-def clear_signal_manual():
-    """Manual clear button"""
-    global current_signal
-    current_signal = {
-        "signal": "NONE",
-        "timestamp": "",
-        "status": "PROCESSED",
-        "source": "none"
-    }
-    log(f"✅ Signal manually cleared!")
+---
 
+## 🛡️ Safety rules the bridge enforces
 
-def watch_signals_folder():
-    """Monitor folder for new JSON signal files
-    
-    Watches SIGNALS_FOLDER for *.json files containing trade signals.
-    Files should contain:
-    {
-        "signal": "BUY SL=50 TP=100 LOT=0.01",
-        "timestamp": "2025-09-16T14:30:45Z"
-    }
-    
-    Files are processed in order of creation and deleted after processing.
-    """
-    global current_signal
-    
-    processed_files = set()
-    
-    while True:
-        try:
-            # Ensure folder exists
-            if not os.path.exists(SIGNALS_FOLDER):
-                time.sleep(CHECK_INTERVAL)
-                continue
-            
-            # Find all JSON files in folder, sorted by creation time (oldest first)
-            json_files = sorted(
-                Path(SIGNALS_FOLDER).glob("*.json"),
-                key=lambda f: f.stat().st_ctime
-            )
-            
-            for json_file in json_files:
-                file_key = str(json_file)
-                
-                # Skip already processed files
-                if file_key in processed_files:
-                    continue
-                
-                try:
-                    # Read JSON file
-                    with open(json_file, 'r') as f:
-                        data = json.load(f)
-                    
-                    # Extract signal from JSON
-                    signal_value = data.get('signal', 'NONE')
-                    
-                    # Validate signal
-                    if not signal_value or signal_value == 'NONE':
-                        log(f"⚠️ SKIPPED: {json_file.name} - invalid or empty signal")
-                        processed_files.add(file_key)
-                        try:
-                            os.remove(json_file)
-                        except:
-                            pass
-                        continue
-                    
-                    # Check if previous signal is still pending
-                    if current_signal["status"] == "NEW":
-                        log(f"⚠️ QUEUED: '{json_file.name}' - waiting for previous signal to complete")
-                        # Don't mark as processed yet; retry next iteration
-                        continue
-                    
-                    # Set new signal from file
-                    current_signal = {
-                        "signal": signal_value,
-                        "timestamp": datetime.now().isoformat(),
-                        "status": "NEW",
-                        "source": "file",
-                        "source_file": json_file.name
-                    }
-                    
-                    log(f"📊 NEW Signal from '{json_file.name}': {signal_value}")
-                    
-                    # Mark as processed
-                    processed_files.add(file_key)
-                    
-                    # Delete file after successful processing
-                    try:
-                        os.remove(json_file)
-                        log(f"✅ Processed and deleted {json_file.name}")
-                    except Exception as e:
-                        log(f"⚠️ Could not delete {json_file.name}: {e}")
-                    
-                except json.JSONDecodeError as e:
-                    log(f"❌ INVALID JSON in {json_file.name}: {e}")
-                    processed_files.add(file_key)
-                    try:
-                        os.remove(json_file)
-                    except:
-                        pass
-                except Exception as e:
-                    log(f"❌ ERROR reading {json_file.name}: {e}")
-                
-        except Exception as e:
-            log(f"❌ Watcher error: {e}")
-        
-        time.sleep(CHECK_INTERVAL)
+1. **Never invent a trade parameter.** Missing or ambiguous size/symbol/direction is a rejection, not a default.
+2. **Never send the same command twice.** Commands are deduplicated by content hash and by `request_id`; the ledger survives restarts, so a replayed file or a retried POST cannot produce a second trade.
+3. **An unacknowledged dispatch is never silently resent.** If the EA does not acknowledge within the dispatch timeout the signal becomes `expired` with a loud board entry; retrying mints a new `request_id` on purpose.
+4. **A late acknowledgement wins.** If the EA reports success after the bridge gave up waiting, the ledger records the trade that actually happened.
+5. **Corrupt input never trades.** A truncated or non-JSON `.json` file is recorded as `invalid` and its copy parked `.invalid`; it is never offered to the legacy text parser.
+6. **The inbox belongs to its producers.** The bridge reads it and never writes to it - no renames, no markings, no deletions - so other applications sharing that folder see their files exactly as they left them.
+7. **Everything is auditable.** Rejected and invalid commands get ledger rows and events too - the board shows what was refused, not only what traded.
 
+---
 
-@app.route('/signal', methods=['GET'])
-def get_signal():
-    """MT5 reads from here
-    
-    Returns current signal in JSON format:
-    {
-        "signal": "BUY SL=50 TP=100 LOT=0.01",
-        "timestamp": "2025-09-16T14:30:45Z",
-        "status": "NEW" or "PROCESSED",
-        "source": "http" or "file"
-    }
-    """
-    return jsonify(current_signal)
+## 🔌 Endpoints
 
+**EA-facing** (no `Origin` header, so the origin check does not apply):
+`GET /signal` · `POST /signal/processed` · `POST /signal` (legacy) · `POST /signal/clear` · `GET /health`
 
-@app.route('/signal', methods=['POST'])
-def post_signal():
-    """Accept signals via HTTP POST (backward compatible)
-    
-    Request body:
-    {
-        "signal": "SELL"
-    }
-    """
-    global current_signal
-    data = request.json
-    signal_value = data.get('signal', 'NONE')
-    
-    # Check if signal is already pending
-    if current_signal["status"] == "NEW":
-        log(f"⚠️ REJECTED: '{signal_value}' - Previous signal still pending!")
-        return jsonify({"status": "rejected", "reason": "signal_pending"})
-    
-    # Set new signal from HTTP
-    current_signal = {
-        "signal": signal_value,
-        "timestamp": datetime.now().isoformat(),
-        "status": "NEW",
-        "source": "http"
-    }
-    
-    log(f"📊 NEW Signal (HTTP): {signal_value}")
-    return jsonify({"status": "success"})
+**Operator / API:**
+`GET|POST /api/v1/signals` · `GET /api/v1/signals/<id>` · `POST /api/v1/signals/<id>/cancel|retry|requeue` · `POST /api/v1/validate` · `GET /api/v1/events` · `GET /api/v1/metrics` · `GET|PATCH /api/v1/settings` · `GET /api/v1/contract` · `GET /api/v1/watcher` · `GET /api/v1/state` · `POST /api/v1/rescan` · `GET /api/v1/stream` (SSE)
 
+---
 
-@app.route('/signal/processed', methods=['POST'])
-def mark_processed():
-    """MT5 calls this after executing trade"""
-    global current_signal
-    current_signal["status"] = "PROCESSED"
-    log(f"✅ Signal marked as PROCESSED")
-    return jsonify({"status": "success"})
+## 🔒 Security
 
+- The bridge binds to `127.0.0.1` by default. Loopback is not a trust boundary by itself, so intake routes additionally require an allowed `Origin` (TradingView, or the board's own origin) when the request comes from a browser.
+- Set `intake_token` (Settings tab or `INTAKE_TOKEN`) to require an `X-Bridge-Token` header on every intake route. The token is masked in all API responses.
+- Request bodies are capped at 1 MiB.
 
-@app.route('/signal/clear', methods=['POST'])
-def clear_signal():
-    """Reset to NONE"""
-    global current_signal
-    current_signal = {
-        "signal": "NONE",
-        "timestamp": "",
-        "status": "PROCESSED",
-        "source": "none"
-    }
-    log("🗑️ Signal cleared")
-    return jsonify({"status": "success"})
+---
 
+## 🧪 Tests and build
 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    return jsonify({"status": "running"})
+```powershell
+python -m pip install -r Trading_Bridge_Source/requirements.txt
+python -m pytest Trading_Bridge_Source/tests      # 89 tests: contract, schema, store, service, watcher, HTTP
+powershell -File build.ps1                          # PyInstaller onefile + distributable zip
+```
 
+---
 
-def run_production_server():
-    """Run production server with Waitress"""
-    try:
-        # Try to import waitress (production server)
-        from waitress import serve
-        log("🚀 Starting production server (Waitress)...")
-        serve(app, host='127.0.0.1', port=8080, threads=4)
-    except ImportError:
-        # Fallback to Flask dev server if waitress not installed
-        log("⚠️ Waitress not found, using development server")
-        log("⚠️ For production use: pip install waitress")
-        app.run(host='127.0.0.1', port=8080, debug=False, use_reloader=False)
+## 📚 Documentation
 
+- [INSTALL_AND_TEST_GUIDE.md](INSTALL_AND_TEST_GUIDE.md) - setup and end-to-end test procedure
+- [FILE_IO_GUIDE.md](FILE_IO_GUIDE.md) - folder intake, file markings, examples
+- [AUDIT_AND_COMMANDS.md](AUDIT_AND_COMMANDS.md) - command schema, ledger fields, endpoints
+- [TEST_MATRIX.md](TEST_MATRIX.md) - the behaviours the test suite pins down
+- [DISCLAIMER.md](DISCLAIMER.md) - the risk warning in full
 
-def create_gui():
-    global log_widget
-    
-    root = tk.Tk()
-    root.title("TradingBridge Server - File I/O Mode")
-    root.geometry("600x480")
-    
-    # Header
-    header = tk.Label(root, text="🚀 TradingView Bridge - File I/O Mode", 
-                      font=("Arial", 14, "bold"), 
-                      bg="#4CAF50", fg="white", pady=10)
-    header.pack(fill=tk.X)
-    
-    # Status
-    status = tk.Label(root, text="✅ Production Server Running on localhost:8080", 
-                      font=("Arial", 10), fg="green")
-    status.pack(pady=5)
-    
-    # Folder info
-    folder_info = tk.Label(root, text=f"📁 Watching: {SIGNALS_FOLDER}", 
-                          font=("Arial", 9), fg="blue", wraplength=550)
-    folder_info.pack(pady=2)
-    
-    # Mode indicator
-    mode_label = tk.Label(root, text="Mode: File I/O (+ HTTP fallback)", 
-                         font=("Arial", 9), fg="orange")
-    mode_label.pack(pady=2)
-    
-    # Clear button
-    clear_btn = tk.Button(root, 
-                         text="🗑️ Clear Old Signal", 
-                         command=clear_signal_manual,
-                         font=("Arial", 10, "bold"),
-                         bg="#FF6B6B", 
-                         fg="white",
-                         cursor="hand2",
-                         relief="raised",
-                         padx=20,
-                         pady=5)
-    clear_btn.pack(pady=5)
-    
-    # Instructions
-    info = tk.Label(root, text="Drop JSON files into the signals folder or POST to /signal", 
-                    font=("Arial", 9), fg="gray")
-    info.pack()
-    
-    # Log section
-    tk.Label(root, text="Signal Log:", font=("Arial", 9, "bold")).pack(pady=5)
-    
-    log_widget = scrolledtext.ScrolledText(root, height=16, 
-                                           font=("Courier", 9),
-                                           bg="#1e1e1e", fg="#00ff00")
-    log_widget.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
-    
-    # Initial messages
-    log("✅ Server started successfully!")
-    log("🔧 Production mode - No Flask warnings!")
-    log(f"👀 Watching folder: {SIGNALS_FOLDER}")
-    log("📡 Waiting for JSON signal files or HTTP POST requests...")
-    log("")
-    log("JSON file format:")
-    log('  {"signal": "BUY SL=50 TP=100 LOT=0.01"}')
-    
-    # Ensure signals folder exists
-    try:
-        os.makedirs(SIGNALS_FOLDER, exist_ok=True)
-        log(f"✅ Signals folder ready: {SIGNALS_FOLDER}")
-    except Exception as e:
-        log(f"❌ Could not create signals folder: {e}")
-    
-    # Start file watcher in background thread
-    watcher_thread = threading.Thread(target=watch_signals_folder, daemon=True)
-    watcher_thread.start()
-    
-    # Start server in background thread
-    server_thread = threading.Thread(target=run_production_server, daemon=True)
-    server_thread.start()
-    
-    root.mainloop()
+## License
 
-
-if __name__ == '__main__':
-    print("WARNING: This software can execute live trades. Use at your own risk. See README for full disclaimer.")
-    create_gui()
+MIT - see [LICENSE](LICENSE).

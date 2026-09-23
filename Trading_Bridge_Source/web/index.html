@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TradingBridge · Signal Board</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">TB</span>
+    <div>
+      <h1>TradingBridge</h1>
+      <p class="brand-sub">signal board · <span id="contract-version">…</span></p>
+    </div>
+  </div>
+
+  <div class="pills">
+    <span class="pill" id="pill-connection" title="How this page receives updates">connecting</span>
+    <span class="pill" id="pill-ea" title="Bot_Trader polls GET /signal. Online means it polled recently.">EA …</span>
+    <span class="pill" id="pill-queue" title="Commands waiting to be handed to the EA">queue 0</span>
+    <span class="pill" id="pill-folder" title="Files in the read-only inbox the bridge has not consumed yet">inbox 0</span>
+    <span class="pill" id="pill-mode" title="strict requires a command to state its own symbol and size">strict</span>
+  </div>
+
+  <div class="topbar-actions">
+    <button class="btn" id="btn-pause">Pause dispatch</button>
+    <button class="btn" id="btn-rescan">Scan folder</button>
+    <button class="btn btn-danger" id="btn-clear">Clear queue</button>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab is-active" data-view="board">Board</button>
+  <button class="tab" data-view="signals">Signals <span class="badge" id="badge-signals">0</span></button>
+  <button class="tab" data-view="events">Events <span class="badge" id="badge-events">0</span></button>
+  <button class="tab" data-view="send">Send</button>
+  <button class="tab" data-view="settings">Settings</button>
+  <button class="tab" data-view="contract">EA contract</button>
+</nav>
+
+<main>
+
+  <!-- =========================================================== BOARD -->
+  <section class="view is-active" id="view-board">
+    <div class="kpis" id="kpis"></div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h2>Throughput <span class="panel-note" id="throughput-note"></span></h2>
+        <canvas id="chart-throughput" height="150"></canvas>
+      </div>
+      <div class="panel">
+        <h2>Outcome mix</h2>
+        <div id="status-bars" class="bars"></div>
+      </div>
+    </div>
+
+    <div class="grid-3">
+      <div class="panel">
+        <h2>By symbol</h2>
+        <div id="symbol-bars" class="bars"></div>
+      </div>
+      <div class="panel">
+        <h2>By action</h2>
+        <div id="action-bars" class="bars"></div>
+      </div>
+      <div class="panel">
+        <h2>Latency</h2>
+        <div id="latency" class="stat-list"></div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h2>Return codes <span class="panel-note">negative = a bridge or EA guard fired, positive = the broker refused</span></h2>
+        <table class="table" id="retcode-table">
+          <thead><tr><th>Retcode</th><th>Meaning</th><th class="num">Count</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2>Live events</h2>
+        <ul class="feed" id="board-feed"></ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= SIGNALS -->
+  <section class="view" id="view-signals">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Signal ledger</h2>
+        <div class="filters">
+          <input type="search" id="filter-search" placeholder="search request_id, symbol, result…">
+          <select id="filter-status"><option value="">all statuses</option></select>
+          <select id="filter-symbol"><option value="">all symbols</option></select>
+          <select id="filter-action"><option value="">all actions</option></select>
+          <button class="btn btn-small" id="btn-refresh-signals">Refresh</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="table" id="signals-table">
+          <thead>
+            <tr>
+              <th>When</th><th>Request ID</th><th>Source</th><th>Action</th><th>Symbol</th>
+              <th class="num">Size</th><th>Status</th><th class="num">Retcode</th>
+              <th>Result</th><th class="num">Queue ms</th><th class="num">Exec ms</th><th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="btn btn-small" id="btn-prev">Newer</button>
+        <span id="pager-label">—</span>
+        <button class="btn btn-small" id="btn-next">Older</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================== EVENTS -->
+  <section class="view" id="view-events">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Event timeline</h2>
+        <label class="toggle"><input type="checkbox" id="events-follow" checked> follow</label>
+      </div>
+      <ul class="feed feed-large" id="events-feed"></ul>
+    </div>
+  </section>
+
+  <!-- ============================================================ SEND -->
+  <section class="view" id="view-send">
+    <div class="grid-2">
+      <div class="panel">
+        <h2>Compose a command</h2>
+        <p class="panel-note">
+          Anything Bot_Trader v6.5 accepts is accepted here. Validate first: it runs the
+          same normalization and checks as a real submission but writes nothing and sends nothing.
+        </p>
+        <div class="builder" id="builder"></div>
+        <label class="field-label" for="send-json">Command JSON</label>
+        <textarea id="send-json" spellcheck="false" rows="16"></textarea>
+        <div class="row">
+          <button class="btn" id="btn-validate">Validate</button>
+          <button class="btn btn-primary" id="btn-send">Send to MT5</button>
+          <button class="btn" id="btn-format">Format</button>
+          <select id="send-examples"><option value="">load an example…</option></select>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Result</h2>
+        <div id="send-result" class="result-empty">Nothing checked yet.</div>
+        <h2 class="mt">What the EA would receive</h2>
+        <pre id="send-envelope" class="code">—</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================== SETTINGS -->
+  <section class="view" id="view-settings">
+    <div class="grid-2">
+      <div class="panel">
+        <h2>Runtime settings</h2>
+        <p class="panel-note">
+          Changes take effect immediately and survive a restart. All fields are applied
+          together: if one is invalid, none of them change.
+        </p>
+        <form id="settings-form"></form>
+        <div class="row">
+          <button class="btn btn-primary" id="btn-save-settings">Save</button>
+          <button class="btn" id="btn-reload-settings">Discard</button>
+        </div>
+        <div id="settings-result"></div>
+      </div>
+      <div class="panel">
+        <h2>Intake</h2>
+        <p class="panel-note">
+          The inbox is shared with other producers and is <strong>read-only</strong>: the bridge
+          lists and reads it, never renames, marks or deletes anything there. Every file it
+          consumes is copied into its own data folder, and the copy carries the outcome.
+          What has already been consumed is remembered in the ledger, not in the inbox.
+          You can point it at a different folder above without restarting; whatever is already
+          in the new folder is adopted and will not be traded.
+        </p>
+        <div id="intake-info" class="stat-list"></div>
+        <h2 class="mt">Fixed at startup</h2>
+        <p class="panel-note">
+          These need a restart because they rebind sockets or move the ledger. Set them with
+          <code>TRADING_BRIDGE_*</code> environment variables or command-line flags.
+        </p>
+        <div id="fixed-info" class="stat-list"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================== CONTRACT -->
+  <section class="view" id="view-contract">
+    <div class="grid-2">
+      <div class="panel">
+        <h2>Actions</h2>
+        <p class="panel-note">Canonical name and every alias Bot_Trader accepts, case-insensitively.</p>
+        <div id="contract-actions"></div>
+      </div>
+      <div class="panel">
+        <h2>Units and fields</h2>
+        <div id="contract-units" class="stat-list"></div>
+        <h2 class="mt">Signal lifecycle</h2>
+        <div id="contract-statuses"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Return codes</h2>
+      <div class="grid-2">
+        <div>
+          <h3 class="subhead">Local guards (negative — the EA never reached the broker)</h3>
+          <table class="table" id="contract-local"><thead><tr><th>Code</th><th>Meaning</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div>
+          <h3 class="subhead">Broker rejections (positive)</h3>
+          <table class="table" id="contract-broker"><thead><tr><th>Code</th><th>Meaning</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div>
+          <h3 class="subhead">Broker success (positive — the trade happened)</h3>
+          <table class="table" id="contract-success"><thead><tr><th>Code</th><th>Meaning</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ========================================================== DRAWER -->
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <h2 id="drawer-title">Signal</h2>
+    <button class="btn btn-small" id="drawer-close">Close</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+<div class="scrim" id="scrim"></div>
+<div class="toasts" id="toasts"></div>
+
+<footer class="footer">
+  TradingBridge can place real orders on your broker account. Validate every change on a demo account first.
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

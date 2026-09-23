@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+dist/
+build/
+*.spec
+TradingBridge-Universal.zip
+
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+.venv/
+venv/
+.idea/
+.vscode/
+Thumbs.db
