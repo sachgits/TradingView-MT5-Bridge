@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import contract
-from .util import to_ea_timestamp
+from .util import to_ea_timestamp, utc_now
 
 SCHEMA_VERSION = 3
 
@@ -733,6 +733,28 @@ class Store:
     def get_runtime(self, key: str) -> Optional[str]:
         row = self._conn.execute("SELECT value FROM runtime WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
+
+    # ------------------------------------------------------ account snapshot
+    # The EA's "account" action returns a full snapshot of the account, its open
+    # positions and its pending orders. It is transient state, not a signal, so
+    # it lives in the runtime KV table under one key rather than in the ledger:
+    # a snapshot is overwritten wholesale and carries no history the operator
+    # needs to audit. Stored verbatim - the bridge never reinterprets a value.
+    def store_account_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        self.set_runtime("account_snapshot", json.dumps(snapshot, default=str))
+        self.set_runtime("account_snapshot_at", utc_now())
+
+    def load_account_snapshot(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        raw = self.get_runtime("account_snapshot")
+        if not raw:
+            return None, None
+        try:
+            snapshot = json.loads(raw)
+        except json.JSONDecodeError:
+            return None, None
+        if not isinstance(snapshot, dict):
+            return None, None
+        return snapshot, self.get_runtime("account_snapshot_at")
 
     # -------------------------------------------------------------- metrics
     def metrics(self, since_seconds: int = 3600) -> Dict[str, Any]:

@@ -1,10 +1,25 @@
 """Trade-journal JSON is extracted into a lean EA command; the inbox is untouched."""
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 
 from bridge import schema, validator
 from bridge.service import public_command
 
 from conftest import BUY
+
+
+def fresh(record, seconds_ago=0):
+    """A journal record is a *now* signal, so fixtures need a live trigger stamp.
+
+    The bridge refuses a trigger older than journal_max_age_seconds: history left
+    in a shared inbox must not become a burst of market orders.
+    """
+    out = deepcopy(record)
+    stamp = (datetime.now(timezone.utc).replace(microsecond=0)
+             - timedelta(seconds=seconds_ago)).isoformat()
+    out["lifecycle"]["generated_at"] = stamp
+    out["lifecycle"]["triggered_at"] = stamp
+    return out
 
 FLO = {
     "id": "20260922T195825Z_FLO_GBPCHF_long",
@@ -174,7 +189,7 @@ def test_atr_context_is_used_only_when_there_is_no_stop():
 
 
 def test_journal_submit_is_queued_and_raw_payload_keeps_the_full_record(service):
-    result = service.submit(FLO, source="file", source_file="FLO_GBPCHF_long.json")
+    result = service.submit(fresh(FLO), source="file", source_file="FLO_GBPCHF_long.json")
     assert result["ok"] is True
     assert result["status"] == "queued"
     stored = service.store.get_signal(result["request_id"])
@@ -187,3 +202,46 @@ def test_journal_submit_is_queued_and_raw_payload_keeps_the_full_record(service)
     assert envelope["normalized"]["symbol"] == "GBPCHF"
     assert "pair" not in envelope["normalized"]
     assert "setup" not in envelope["normalized"]
+
+
+def test_a_stale_journal_trigger_is_refused_not_traded(service):
+    result = service.submit(fresh(FLO, seconds_ago=7200))
+    assert result["ok"] is False
+    assert any("journal_max_age_seconds" in e for e in result["errors"])
+    assert service.store.queue_depth() == 0
+
+
+def test_the_age_gate_follows_the_setting(service):
+    service.settings.journal_max_age_seconds = 0
+    assert service.submit(fresh(FLO, seconds_ago=7200))["ok"] is True
+
+
+def test_preview_reports_the_stale_refusal_before_anything_is_queued(service):
+    report = service.preview(fresh(FLO, seconds_ago=7200))
+    assert report["valid"] is False
+    assert any("journal_max_age_seconds" in e for e in report["errors"])
+    assert service.store.queue_depth() == 0
+
+
+def test_a_native_command_is_not_subject_to_the_journal_age_gate(service):
+    old = dict(BUY)
+    old["timestamp"] = "2020-01-01T00:00:00+00:00"
+    assert service.submit(old)["ok"] is True
+
+
+def test_an_in_place_journal_update_cannot_trade_twice(service):
+    """The journal app fills in its own record as the trade progresses.
+
+    The request_id is the journal id, and an explicit request_id is an
+    idempotency key, so the updated record is a duplicate rather than a second
+    order.
+    """
+    first = fresh(FLO)
+    assert service.submit(first)["ok"] is True
+    updated = deepcopy(first)
+    updated["resolution"]["outcome"] = "win"
+    updated["lifecycle"]["closed_at"] = updated["lifecycle"]["triggered_at"]
+    second = service.submit(updated)
+    assert second["ok"] is False
+    assert second["status"] == "duplicate"
+    assert service.store.queue_depth() == 1

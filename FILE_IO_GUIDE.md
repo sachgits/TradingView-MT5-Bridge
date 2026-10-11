@@ -21,7 +21,7 @@ File I/O mode lets you:
 
 | | Folder | Who owns it | What the bridge does |
 |---|---|---|---|
-| **Inbox** | `C:\Trades\signals` | you and every other app that produces signals | lists it, stats it, reads it. **Never renames, writes, marks or deletes anything.** |
+| **Inbox** | `C:\Trades\trade_journal` | you and every other app that produces signals | lists it, stats it, reads it. **Never renames, writes, marks or deletes anything.** |
 | **Data** | `C:\Trades\TradingBridge` | the bridge | keeps the SQLite ledger, a copy of every file it consumed, and the copies of anything a crash left open |
 
 The inbox is shared, so it is treated as strictly read-only: the bridge works
@@ -45,7 +45,7 @@ second execution.
 ### 1. Folders
 
 ```
-inbox : C:\Trades\signals\        read by the bridge, written by your producers
+inbox : C:\Trades\trade_journal\  read by the bridge, written by your producers
 data  : C:\Trades\TradingBridge\  written by the bridge only
         ├── bridge.sqlite3        the ledger
         ├── intake\               one copy per consumed file, marked with its outcome
@@ -100,9 +100,10 @@ restart:
 
 | Setting | Env var | Default | Meaning |
 |---|---|---|---|
-| `signals_folder` | `TRADING_BRIDGE_SIGNALS_FOLDER` | `C:\Trades\signals` | The inbox. Editable from the board; see below. |
+| `signals_folder` | `TRADING_BRIDGE_SIGNALS_FOLDER` | `C:\Trades\trade_journal` | The inbox. Editable from the board; see below. |
 | `watch_interval` | `TRADING_BRIDGE_WATCH_INTERVAL` | `1.0` s | How often the inbox is scanned. Clamped to 0.1–3600. |
 | `file_settle_ms` | `TRADING_BRIDGE_FILE_SETTLE_MS` | `300` ms | How long a file must be unchanged before it is read, so a half-written file is never parsed. |
+| `journal_max_age_seconds` | `TRADING_BRIDGE_JOURNAL_MAX_AGE_SECONDS` | `3600` s | A trade-journal record whose trigger stamp is older than this is refused as history, not traded. `0` disables the check. See [Trade-journal records](#trade-journal-records). |
 | `enable_file_intake` | `TRADING_BRIDGE_FILE_INTAKE` | `true` | Master switch for the watcher. |
 
 ### Switching the inbox
@@ -182,6 +183,31 @@ no symbol, so the EA trades its chart symbol.
 }
 ```
 
+**Pending order** (EA v6.5): the entry price is either absolute (`price_unit:
+"price"`) or a signed offset in points from the current Ask/Bid (`price_unit:
+"points"` or `"distance"` — positive above, negative below). Stop-loss and
+take-profit distances are measured from the *order* price, not the market. A
+stop-limit pair needs the inner `stoplimit`; an `expiration` in ISO 8601 or MT5
+`yyyy.mm.dd hh:mm` form is optional.
+
+```json
+{
+  "symbol": "EURUSD",
+  "action": "buy_stop",
+  "size": { "value": 0.01, "unit": "lots" },
+  "price": 120,
+  "price_unit": "points",
+  "stop_loss": { "unit": "points", "value": 200 },
+  "take_profit": { "unit": "points", "value": 400 },
+  "expiration": "2026-12-31T23:59:59"
+}
+```
+
+`cancel_pending` and `modify_pending` target an `order_ticket` (or a symbol plus
+the bot's magic when no ticket is given); `modify_pending` needs at least one of
+`price`, `stop_loss`, `take_profit` or `expiration`. The EA refuses a pending it
+cannot place cleanly with its own guard codes `-40`..`-43` rather than guessing.
+
 Optional envelope fields:
 
 | Field | Notes |
@@ -199,10 +225,86 @@ own data folder and are never scanned as commands.
 
 ---
 
+## Trade-journal records
+
+The default inbox, `C:\Trades\trade_journal`, is written by a playbook journal,
+not by a trading client. Its files are **research records** — `pair`/`direction`,
+absolute `setup` prices, nested `sizing`, a `lifecycle` and a `status` — none of
+which Bot_Trader understands as-is. Forwarding the whole object would also be
+unsafe: the EA's JSON reader is an unscoped substring scan, so extra keys leak
+into the command.
+
+The bridge recognises that shape and extracts a lean EA command from it. Nothing
+is invented: every field on the command comes from the record, and a record that
+cannot be mapped safely is refused with a reason rather than guessed at.
+
+| Journal field | Becomes | Notes |
+|---|---|---|
+| `pair` (or `symbol`) | `symbol` | required |
+| `direction` `long`/`short` | `action` `buy`/`sell` | anything else is refused |
+| `sizing.lots` | `size` (fixed lots) | omitted if absent — the EA applies its own `LotSize` |
+| `setup.entry` + `setup.stop` | `stop_loss` as a `price_distance` gap | the gap from entry, so the journal's R-multiple survives; a wrong-side stop is refused |
+| `setup.entry` + `setup.target` | `take_profit` as a `price_distance` gap | omitted when `target` is null |
+| `sizing.pip_distance` | `stop_loss` in points | **fallback only**, used when there is no `setup.stop` and no `atr_context` |
+| `management.atr_context` | `stop_loss` in ATR | used only when there is no `setup.stop` |
+| `management.breakeven.trigger_r` | `breakeven.trigger` | `trigger_r` × the stop distance |
+| `id` | `request_id` = `"{id}:{action}"` | the idempotency key — see below |
+| `playbook`/`tag`/`book` | `strategy_id` | for the board |
+| `lifecycle.triggered_at` | `timestamp` + the freshness gate | |
+
+**The entry price is recorded, not used.** EA v6.5 ignores `price` and fills at
+market; `setup.entry` is kept on the command for the board and is the origin the
+stop/target gaps are measured from. Each journal command carries warnings saying
+so.
+
+**Status decides whether it trades at all.** `triggered`/`active`/`open`/`live`/
+`filled`/`working` → an entry. `closed`/`stopped`/`resolved`/`completed`/
+`cancelled`/`expired`/`target_hit`/`stopped_out` → a `close_position` for that
+symbol. `pending`/`wait`/`watch`/`idea`/`setup`/`draft`/`candidate`/`planned`/
+`armed` → refused as "not an executable trade". An unrecognised status is treated
+as an entry with a warning.
+
+**In-place updates cannot trade twice.** The journal app rewrites its own record
+as the trade progresses — filling in the exit price, flipping `status` to
+`closed`. Because `request_id` is the journal `id`, the updated file is the *same*
+idempotency key, so it is detected as a duplicate rather than fired as a second
+order. (A `status` that maps to `close_position` uses a distinct
+`"{id}:close_position"` key, so flattening the position is a deliberate, separate
+instruction.)
+
+**History is refused, not traded** — `journal_max_age_seconds`. A shared inbox
+accumulates old records, and pointing the bridge at a folder of them must not
+queue one market order per file. A journal record whose `lifecycle.triggered_at`
+is older than `journal_max_age_seconds` (default `3600`) is rejected with
+`journal trigger ... is ...s old, older than journal_max_age_seconds`. The refusal
+is visible on the board and in the ledger; nothing is queued. Set it to `0` to
+disable the check. Native (non-journal) commands are never subject to this gate.
+This is the second layer over [adoption](#switching-the-inbox): adoption guards a
+folder the inbox *switched* to, the age gate guards a record that is simply old.
+
+A worked example — `20260922T195825Z_FLO_GBPCHF_long.json` becomes:
+
+```json
+{
+  "action": "buy",
+  "symbol": "GBPCHF",
+  "size": { "type": "fixed", "unit": "lots", "value": 0.02 },
+  "stop_loss": { "type": "distance", "unit": "price_distance", "value": 0.00221 },
+  "take_profit": { "type": "distance", "unit": "price_distance", "value": 0.00442 },
+  "request_id": "20260922T195825Z_FLO_GBPCHF_long:buy",
+  "strategy_id": "Flossbach Liquidation Sweep"
+}
+```
+
+The original record is never rewritten; it is kept whole in the ledger's
+`raw_payload` for audit.
+
+---
+
 ## Lifecycle
 
 ```
-you write C:\Trades\signals\my_command.json           (inbox: read-only to us)
+you write C:\Trades\trade_journal\my_command.json     (inbox: read-only to us)
         |
 watcher waits file_settle_ms for the write to finish
         |
@@ -300,7 +402,7 @@ execution of a trade that may already have happened.
 import json, time
 from pathlib import Path
 
-FOLDER = Path(r"C:\Trades\signals")
+FOLDER = Path(r"C:\Trades\trade_journal")
 
 def send(command: dict) -> Path:
     path = FOLDER / f"cmd_{int(time.time() * 1000)}.json"
@@ -319,12 +421,12 @@ send({"request_id": "bot-0001", "symbol": "EURUSD", "action": "buy", "size": 0.1
 ```powershell
 @{ request_id = "ps-0001"; signal = "SELL SL=75 TP=150 LOT=0.02" } |
   ConvertTo-Json |
-  Set-Content "C:\Trades\signals\ps_signal.json" -Encoding UTF8
+  Set-Content "C:\Trades\trade_journal\ps_signal.json" -Encoding UTF8
 ```
 
 ### Manual test
 
-Create `C:\Trades\signals\test.json`:
+Create `C:\Trades\trade_journal\test.json`:
 
 ```json
 { "signal": "BUY SL=50 TP=100 LOT=0.01" }

@@ -31,6 +31,7 @@ SIGNAL_CANCELLED = "signal.cancelled"
 SIGNAL_REQUEUED = "signal.requeued"
 EA_ONLINE = "ea.online"
 EA_OFFLINE = "ea.offline"
+ACCOUNT_SNAPSHOT = "account.snapshot"
 SETTINGS_CHANGED = "settings.changed"
 WATCHER = "watcher"
 

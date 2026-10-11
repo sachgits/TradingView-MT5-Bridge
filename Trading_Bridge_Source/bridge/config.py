@@ -22,7 +22,7 @@ from . import contract
 
 ENV_PREFIX = "TRADING_BRIDGE_"
 
-DEFAULT_SIGNALS_FOLDER = r"C:\Trades\signals"
+DEFAULT_SIGNALS_FOLDER = r"C:\Trades\trade_journal"
 DEFAULT_DATA_FOLDERNAME = "TradingBridge"
 DEFAULT_DB_FILENAME = "bridge.sqlite3"
 
@@ -63,6 +63,13 @@ class Settings:
     # only read once it has stopped growing.
     file_settle_ms: int = field(default_factory=lambda: _env_int("FILE_SETTLE_MS", 300))
     enable_file_intake: bool = field(default_factory=lambda: _env_bool("FILE_INTAKE", True))
+    # A trade-journal record is a *now* signal: its producer writes it when the
+    # setup triggers, and the bridge reads it within a second or two. A record
+    # whose trigger stamp is older than this is history somebody left in the
+    # inbox, and an inbox full of history must not become a burst of market
+    # orders. Refusing is visible on the board; trading stale triggers is not
+    # recoverable. 0 disables the check.
+    journal_max_age_seconds: int = field(default_factory=lambda: _env_int("JOURNAL_MAX_AGE_SECONDS", 3600))
 
     # --- validation -------------------------------------------------------
     # "strict" requires an entry to state its own symbol and size; "permissive"
@@ -89,6 +96,14 @@ class Settings:
         default_factory=lambda: _env_int("DISPATCH_TIMEOUT_SECONDS", 30)
     )
     paused: bool = field(default_factory=lambda: _env_bool("PAUSED", False))
+
+    # --- account snapshot -------------------------------------------------
+    # How often the bridge asks the EA for a read-only account/positions
+    # snapshot, in seconds. The request is injected only when the trade queue is
+    # empty, so it can never delay a real order, and the "account" action places
+    # nothing - it works even when trading is disabled or the market is closed.
+    # 0 disables automatic polling (the board can still request one on demand).
+    account_poll_seconds: int = field(default_factory=lambda: _env_int("ACCOUNT_POLL_SECONDS", 30))
 
     # --- server -----------------------------------------------------------
     host: str = field(default_factory=lambda: _env("HOST", "127.0.0.1"))
@@ -199,10 +214,12 @@ class Settings:
         """Keep values inside sane bounds after any mutation."""
         self.watch_interval = min(max(self.watch_interval, 0.1), 3600.0)
         self.file_settle_ms = int(min(max(self.file_settle_ms, 0), 60_000))
+        self.journal_max_age_seconds = int(min(max(self.journal_max_age_seconds, 0), 604_800))
         self.max_queue_depth = int(min(max(self.max_queue_depth, 1), 10_000))
         self.signal_ttl_seconds = int(min(max(self.signal_ttl_seconds, 5), 86_400))
         self.dedup_window_seconds = int(min(max(self.dedup_window_seconds, 0), 86_400))
         self.dispatch_timeout_seconds = int(min(max(self.dispatch_timeout_seconds, 5), 3_600))
+        self.account_poll_seconds = int(min(max(self.account_poll_seconds, 0), 3_600))
         self.port = int(min(max(self.port, 1), 65_535))
         if self.validation_mode not in ("strict", "permissive"):
             self.validation_mode = "strict"
@@ -325,6 +342,11 @@ MUTABLE: Dict[str, Dict[str, Any]] = {
         "label": "File intake enabled",
         "help": "Turn off to accept commands over HTTP only.",
     },
+    "journal_max_age_seconds": {
+        "type": int, "min": 0, "max": 604_800,
+        "label": "Journal trigger max age (seconds)",
+        "help": "A trade-journal entry whose trigger stamp is older than this is refused as history rather than traded, so an inbox of old records cannot fire a burst of orders. 0 disables the check.",
+    },
     "validation_mode": {
         "type": str, "min": None, "max": None, "choices": ("strict", "permissive"),
         "label": "Validation mode",
@@ -354,6 +376,11 @@ MUTABLE: Dict[str, Dict[str, Any]] = {
         "type": bool, "min": None, "max": None,
         "label": "Pause dispatch",
         "help": "Intake keeps recording, but nothing is handed to the EA. Use this to investigate before resuming.",
+    },
+    "account_poll_seconds": {
+        "type": int, "min": 0, "max": 3_600,
+        "label": "Account snapshot interval (seconds)",
+        "help": "How often the bridge asks the EA for a read-only account and positions snapshot, injected only when the trade queue is empty. 0 disables automatic polling.",
     },
     "require_origin": {
         "type": bool, "min": None, "max": None,

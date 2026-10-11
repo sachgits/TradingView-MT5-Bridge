@@ -1,5 +1,5 @@
 //+---------------------------------------------------------------------+
-//| TradingView to MT5 Bridge - Trading Bot v6.5                        |
+//| TradingView to MT5 Bridge - Trading Bot v6.4                         |
 //| Universal command processor                                          |
 //|                                                                      |
 //| Wire protocol (bridge envelope):                                     |
@@ -40,12 +40,50 @@
 //|        bridge (request_id, action, symbol, size, retcode, result)  |
 //|        and appends the same line to a local results log file.       |
 //| v6.4:  scenario & risk management: action aliases + new actions,    |
-//|        size modes lots/percent/risk/money with risk engine (risk %, |
-//|        exposure caps, approx. margin check) and min-stop-distance.  |
-//| v6.5:  fix NormalizeVolume, which clamped EVERY order to the broker |
-//|        minimum lot, discarding all risk/percent/money and explicit  |
-//|        lot sizing; modify now preserves an unspecified SL/TP level  |
-//|        instead of overwriting it with the EA default.               |
+//| v6.5:  account snapshot & pending-order engine.                     |
+//|                                                                     |
+//|   NEW READ-ONLY ACTION (works even when trading is disabled):       |
+//|     {"action":"account"}   (aliases: status, snapshot, info)        |
+//|   The processed-result POST gains a "snapshot" object:              |
+//|     account, name, server, company, currency, margin_mode,          |
+//|     trade_mode, leverage, balance, equity, margin, margin_free,     |
+//|     margin_level, credit, profit, trade_allowed, positions[],       |
+//|     pending_orders[]. Use it to answer "what is my balance, equity  |
+//|     and are there open positions / pending orders?" in one call.    |
+//|                                                                     |
+//|   NEW PENDING-ORDER ACTIONS (price required, absolute by default):  |
+//|     {"action":"buy_limit","symbol":"EURUSD","size":0.10,            |
+//|      "price":1.1000}                                                |
+//|     {"action":"sell_stop","symbol":"EURUSD","size":0.10,            |
+//|      "price":1.1350,"stop_loss":30,"take_profit":60}                |
+//|     {"action":"buy_stop_limit","symbol":"GOLD","size":0.01,         |
+//|      "price":4200.00,"stoplimit":4190.00}                           |
+//|     {"action":"pending","order_type":"sell_limit","symbol":"XAUUSD",|
+//|      "size":0.10,"price":4160.00}                                   |
+//|     {"action":"modify_pending","order_ticket":987654,               |
+//|      "price":1.1050,"expiration":"2026.10.31 18:00"}                |
+//|     {"action":"cancel_pending","order_ticket":987654}               |
+//|     {"action":"cancel_pending","symbol":"*"}   (* = all symbols)    |
+//|   Aliases: buy_stop, sell_limit, buy_stop_limit, sell_stop_limit,   |
+//|   cancel_order, delete_order, delete_pending, modify_order,         |
+//|   update_order, update_pending.                                     |
+//|   Pricing extras:                                                   |
+//|     "price_unit":"points"  -> price is a SIGNED distance from the   |
+//|         current market (+ = above, - = below; buy uses Ask, sell    |
+//|         uses Bid). For stop-limit orders "stoplimit" is the inner   |
+//|         limit price and uses the same unit.                         |
+//|     "expiration":"YYYY.MM.DD HH:MM" or ISO "YYYY-MM-DDTHH:MM:SS"   |
+//|         -> order expires (ORDER_TIME_SPECIFIED).                    |
+//|     SL/TP use the standard stop_loss/take_profit schema and are     |
+//|         measured from the pending order price.                      |
+//|   Pending orders are owned by MagicNumber; cancel/modify only       |
+//|   touch orders whose magic matches (same policy as positions).      |
+//|   NEW local guard retcodes: -40 invalid pending params,             |
+//|   -41 no matching pending order, -42 market closed / no quote,      |
+//|   -43 unparseable expiration. The result body also carries          |
+//|   "order_ticket" when a pending order is placed/modified.           |
+//|        (end of v6.5 notes; v6.4 sizing/exposure detail and the full |
+//|        broker reference live in BROKER_CAPABILITIES.md).            |
 //+---------------------------------------------------------------------+
 //| SIGNAL SENDER GUIDE - READ BEFORE SENDING COMMANDS                  |
 //+---------------------------------------------------------------------+
@@ -89,10 +127,7 @@
 //   action        string   required
 //   symbol        string   optional, defaults to the chart symbol
 //   size          number|object   optional, defaults to the LotSize input
-//   lot           number   alias for a plain lot size. A bare top-level
-//                          "value" is NOT a size alias: the JSON reader cannot
-//                          scope a key search, so "value" would also match a
-//                          nested stop_loss.value and trade it as a lot count.
+//   lot / value   number   aliases for a plain lot size
 //   risk_percent  number   % of balance to risk in "risk" size mode
 //   stop_loss (sl) / take_profit (tp)   number|string|object
 //   sl_distance / tp_distance  number   fallback distances in points
@@ -239,6 +274,8 @@ string lastProcessedSignal = "";
 uint lastSkipLogTime = 0;
 int lastTradeRetcode = 0;
 string lastTradeResult = "PROCESSED";
+string lastAccountSnapshot = "";   // v6.5: JSON body for "account" action
+ulong lastTradeOrderTicket = 0;    // v6.5: ticket of last placed order
 
 struct DistanceSpec
   {
@@ -266,6 +303,15 @@ struct TradeCommand
    DistanceSpec      trailingDistance;
    bool              isLegacy;
    int               closePercent;
+   //--- v6.5: pending-order engine fields
+   string            orderType;      // canonical name: buy_limit, sell_stop, ...
+   double            price;          // pending trigger price (or signed distance)
+   double            stopLimit;      // inner limit price for stop-limit orders
+   ulong             orderTicket;    // target pending order for cancel/modify
+   string            priceUnit;      // "price" (absolute) or "points" (signed distance)
+   string            expiration;     // "YYYY.MM.DD HH:MM" or ISO datetime
+   bool              hasStopLoss;    // true when the payload really carried SL
+   bool              hasTakeProfit;  // true when the payload really carried TP
   };
 
 //+------------------------------------------------------------------+
@@ -484,7 +530,15 @@ void ReportSignalResult(string jsonText, TradeCommand &cmd)
                  "\",\"size\":" + DoubleToString(cmd.size, 6) +
                  ",\"status\":\"" + status +
                  "\",\"retcode\":" + IntegerToString(lastTradeRetcode) +
-                 ",\"result\":\"" + lastTradeResult + "\"}";
+                 ",\"result\":\"" + lastTradeResult + "\"";
+// v6.5: optional extras - the ticket of a placed/modified pending order
+// and the full account snapshot for "account" actions. Appended only
+// when relevant so older consumers are not affected.
+   if(lastTradeOrderTicket > 0)
+      body += ",\"order_ticket\":" + IntegerToString(lastTradeOrderTicket);
+   if(lastAccountSnapshot != "")
+      body += ",\"snapshot\":" + lastAccountSnapshot;
+   body += "}";
 
    char data[];
    char result[];
@@ -654,11 +708,9 @@ double NormalizeVolume(string symbol, double lot)
    double maxV = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
    if(step <= 0)
       step = 0.01;
-   if(lot <= 0)
-      lot = (minV > 0) ? minV : step;
+   if(lot <= 0 || minV > 0)
+      lot = minV > 0 ? minV : lot;
    lot = MathFloor(lot / step + 0.5) * step;
-   if(minV > 0 && lot < minV)
-      lot = minV;
    if(maxV > 0 && lot > maxV)
       lot = maxV;
    return lot;
@@ -688,6 +740,27 @@ string NormalizeAction(string action)
       return "breakeven";
    if(a == "HOLD" || a == "HOLD_POSITION" || a == "NONE" || a == "NOOP" || a == "WAIT" || a == "TREND" || a == "WAIT_FOR")
       return "noop";
+// v6.5: account snapshot and pending-order actions.
+   if(a == "ACCOUNT" || a == "STATUS" || a == "SNAPSHOT" || a == "ACCOUNT_INFO" || a == "INFO")
+      return "account";
+   if(a == "PENDING" || a == "PLACE_PENDING" || a == "PENDING_ORDER" || a == "OPEN_PENDING")
+      return "pending";
+   if(a == "BUY_LIMIT" || a == "BUYLIMIT")
+      return "buy_limit";
+   if(a == "SELL_LIMIT" || a == "SELLLIMIT")
+      return "sell_limit";
+   if(a == "BUY_STOP" || a == "BUYSTOP")
+      return "buy_stop";
+   if(a == "SELL_STOP" || a == "SELLSTOP")
+      return "sell_stop";
+   if(a == "BUY_STOP_LIMIT" || a == "BUYSTOPLIMIT")
+      return "buy_stop_limit";
+   if(a == "SELL_STOP_LIMIT" || a == "SELLSTOPLIMIT")
+      return "sell_stop_limit";
+   if(a == "CANCEL_PENDING" || a == "CANCEL_ORDER" || a == "DELETE_ORDER" || a == "DELETE_PENDING")
+      return "cancel_pending";
+   if(a == "MODIFY_PENDING" || a == "MODIFY_ORDER" || a == "UPDATE_ORDER" || a == "UPDATE_PENDING")
+      return "modify_pending";
    return action; // keep original for unknown actions (reported to bridge)
   }
 
@@ -710,6 +783,14 @@ bool ParseTradeCommand(string jsonText, TradeCommand &cmd)
    cmd.trailingActivation = BuildDistanceSpec("points", 0.0);
    cmd.trailingDistance = BuildDistanceSpec("points", 0.0);
    cmd.isLegacy = false;
+   cmd.orderType = "";
+   cmd.price = 0.0;
+   cmd.stopLimit = 0.0;
+   cmd.orderTicket = 0;
+   cmd.priceUnit = "price";
+   cmd.expiration = "";
+   cmd.hasStopLoss = false;
+   cmd.hasTakeProfit = false;
 
 // The bridge wraps commands in "normalized"; raw top-level payloads
 // stay supported for backwards compatibility.
@@ -744,19 +825,23 @@ bool ParseTradeCommand(string jsonText, TradeCommand &cmd)
    if(cmd.symbol == "")
       cmd.symbol = Symbol();
 
-   if(!IsSymbolAllowed(cmd.symbol))
+// v6.5: "account" is a read-only snapshot and needs no symbol; "*"
+// means "all symbols" for pending-order housekeeping (cancel/modify).
+// Skip the allow-list and availability checks for both.
+   bool needsSymbol = (cmd.action != "account" && cmd.symbol != "*");
+   if(needsSymbol && !IsSymbolAllowed(cmd.symbol))
      {
       Print("⛔ Symbol not in allowed list: ", cmd.symbol);
       return false;
      }
-   if(!IsSymbolAvailable(cmd.symbol))
+   if(needsSymbol && !IsSymbolAvailable(cmd.symbol))
      {
       Print("⛔ Symbol not available in terminal: ", cmd.symbol);
       return false;
      }
 
 // "size" may be a number (-> lots) or an object with a unit:
-// lots | percent | risk | money. A plain "lot" key is accepted too.
+// lots | percent | risk | money. Plain "lot"/"value" keys accepted too.
    cmd.size = JsonGetDouble(cmdObject, "size", 0.0);
    if(cmd.size <= 0 && StringFind(signalText, "{") >= 0)
       cmd.size = JsonGetDouble(signalText, "size", 0.0);
@@ -774,11 +859,8 @@ bool ParseTradeCommand(string jsonText, TradeCommand &cmd)
       cmd.size = JsonGetDouble(cmdObject, "lot", 0.0);
       cmd.sizeUnit = "lots";
      }
-// A bare top-level "value" is deliberately NOT accepted as a size. JsonGetDouble
-// searches the whole command text for the first "value" key and cannot tell a
-// top-level one from a nested one, so {"stop_loss":{"value":200}} with no size
-// would have been read as 200 lots. Leaving size at 0 falls through to the
-// LotSize input, which is the documented behaviour for an unstated volume.
+   if(cmd.size <= 0)
+      cmd.size = JsonGetDouble(cmdObject, "value", 0.0);
    cmd.riskPercent = JsonGetDouble(cmdObject, "risk_percent", DefaultRiskPercent);
 
    cmd.stopLoss = ParseDistanceSpec(cmdObject, "stop_loss", "sl");
@@ -814,6 +896,36 @@ bool ParseTradeCommand(string jsonText, TradeCommand &cmd)
      }
 
    cmd.closePercent = (int)JsonGetDouble(cmdObject, "close_percent", 100.0);
+
+// v6.5: pending-order fields. hasStopLoss/hasTakeProfit record whether
+// the payload REALLY carried SL/TP so "modify_pending" never overwrites
+// existing values with the default point fallbacks.
+   cmd.orderType = JsonGetString(cmdObject, "order_type");
+   if(cmd.orderType == "")
+      cmd.orderType = cmd.action;   // direct action aliases are canonical
+   cmd.price = JsonGetDouble(cmdObject, "price", 0.0);
+   if(cmd.price <= 0)
+      cmd.price = JsonGetDouble(cmdObject, "entry", 0.0);
+   cmd.stopLimit = JsonGetDouble(cmdObject, "stoplimit", 0.0);
+   if(cmd.stopLimit <= 0)
+      cmd.stopLimit = JsonGetDouble(cmdObject, "stop_limit", 0.0);
+   if(cmd.stopLimit <= 0)
+      cmd.stopLimit = JsonGetDouble(cmdObject, "limit_price", 0.0);
+   cmd.orderTicket = (ulong)JsonGetDouble(cmdObject, "order_ticket", 0.0);
+   if(cmd.orderTicket <= 0)
+      cmd.orderTicket = (ulong)JsonGetDouble(cmdObject, "ticket", 0.0);
+   cmd.priceUnit = JsonGetString(cmdObject, "price_unit");
+   if(cmd.priceUnit == "")
+      cmd.priceUnit = "price";
+   cmd.expiration = JsonGetString(cmdObject, "expiration");
+   if(cmd.expiration == "")
+      cmd.expiration = JsonGetString(cmdObject, "expiry");
+   cmd.hasStopLoss = (StringFind(cmdObject, "\"stop_loss\"") >= 0 ||
+                      StringFind(cmdObject, "\"sl\"") >= 0 ||
+                      StringFind(cmdObject, "\"sl_distance\"") >= 0);
+   cmd.hasTakeProfit = (StringFind(cmdObject, "\"take_profit\"") >= 0 ||
+                        StringFind(cmdObject, "\"tp\"") >= 0 ||
+                        StringFind(cmdObject, "\"tp_distance\"") >= 0);
    return true;
   }
 
@@ -994,10 +1106,10 @@ double RiskSizePosition(string symbol, TradeCommand &cmd, int slPoints)
    double riskPct = (cmd.riskPercent > 0) ? cmd.riskPercent : DefaultRiskPercent;
    double lots = cmd.size;
    if(unit == "risk")
-      {
-       double lossPerLot = (slPoints > 0 && tickSize > 0) ? (slPoints * point / tickSize) * tickValue : 0.0;
-       lots = (lossPerLot > 0) ? (balance * riskPct / 100.0) / lossPerLot : LotSize;
-      }
+     {
+      double lossPerLot = (slPoints > 0 && tickSize > 0) ? (slPoints * point / tickSize) * tickValue : 0.0;
+      lots = (lossPerLot > 0) ? (balance * riskPct / 100.0) / lossPerLot : LotSize;
+     }
    if(unit == "percent")
       lots = (balance * (cmd.size > 0 ? cmd.size : riskPct) / 100.0) / (price * contract);
    if(unit == "money" || unit == "currency")
@@ -1038,6 +1150,19 @@ void ExecuteTradeCommand(TradeCommand &cmd)
 // Outcome tracking is global so ReportSignalResult() can send it back.
    lastTradeRetcode = 0;
    lastTradeResult = "PROCESSED";
+   lastAccountSnapshot = "";
+   lastTradeOrderTicket = 0;
+// v6.5: read-only account snapshot - works even when trading is disabled
+// or the market is closed (pure state query, never submits an order).
+   if(cmd.action == "account")
+     {
+      lastAccountSnapshot = BuildAccountSnapshotJson();
+      lastTradeResult = "ACCOUNT SNAPSHOT";
+      Print("📊 Account snapshot: balance=", AccountInfoDouble(ACCOUNT_BALANCE),
+            " equity=", AccountInfoDouble(ACCOUNT_EQUITY),
+            " positions=", PositionsTotal(), " pending=", OrdersTotal());
+      return;
+     }
    if(!TerminalInfoInteger(TERMINAL_CONNECTED))
      {
       lastTradeRetcode = -10;
@@ -1052,7 +1177,7 @@ void ExecuteTradeCommand(TradeCommand &cmd)
       Print("⛔ Trading is disabled in terminal/account. Signal skipped.");
       return;
      }
-   if(PositionsTotal() >= MaxPositions)
+   if((cmd.action == "buy" || cmd.action == "sell") && PositionsTotal() >= MaxPositions)
      {
       lastTradeRetcode = -12;
       lastTradeResult = "SKIPPED: max positions";
@@ -1101,6 +1226,25 @@ void ExecuteTradeCommand(TradeCommand &cmd)
       lastTradeRetcode = 0;
       lastTradeResult = "NOOP";
       Print("ℹ️ No-op signal acknowledged (symbol=", cmd.symbol, ")");
+      return;
+     }
+// v6.5: pending-order engine (place / cancel / modify).
+   if(cmd.action == "pending"        || cmd.action == "buy_limit"     ||
+      cmd.action == "sell_limit"     || cmd.action == "buy_stop"      ||
+      cmd.action == "sell_stop"      || cmd.action == "buy_stop_limit" ||
+      cmd.action == "sell_stop_limit")
+     {
+      PlacePendingOrder(cmd);
+      return;
+     }
+   if(cmd.action == "cancel_pending")
+     {
+      CancelPendingOrder(cmd);
+      return;
+     }
+   if(cmd.action == "modify_pending")
+     {
+      ModifyPendingOrder(cmd);
       return;
      }
    lastTradeRetcode = -13;
@@ -1246,20 +1390,6 @@ void PartialClosePosition(TradeCommand &cmd)
 //+------------------------------------------------------------------+
 void ModifyPosition(TradeCommand &cmd)
   {
-// ResolveDistanceToPoints() substitutes a default whenever a spec has no
-// value, so it cannot tell "not specified" from "specified as zero".
-// Decide which levels the command actually carries BEFORE resolving, so
-// that modifying only the SL leaves the broker's existing TP alone.
-   bool hasSl = (cmd.stopLoss.value > 0 || cmd.stopLoss.unit == "atr");
-   bool hasTp = (cmd.takeProfit.value > 0 || cmd.takeProfit.unit == "atr");
-   if(!hasSl && !hasTp)
-     {
-      lastTradeRetcode = -31;
-      lastTradeResult = "FAILED: modify carried neither SL nor TP";
-      Print("⚠️ Modify command specified no stop_loss or take_profit: ", cmd.symbol);
-      return;
-     }
-
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
@@ -1269,8 +1399,8 @@ void ModifyPosition(TradeCommand &cmd)
         {
          double open = PositionGetDouble(POSITION_PRICE_OPEN);
          double point = SymbolInfoDouble(cmd.symbol, SYMBOL_POINT);
-         int slPts = hasSl ? ResolveDistanceToPoints(cmd.symbol, cmd.stopLoss) : 0;
-         int tpPts = hasTp ? ResolveDistanceToPoints(cmd.symbol, cmd.takeProfit) : 0;
+         int slPts = ResolveDistanceToPoints(cmd.symbol, cmd.stopLoss);
+         int tpPts = ResolveDistanceToPoints(cmd.symbol, cmd.takeProfit);
          double sl = 0, tp = 0;
          long ptype = PositionGetInteger(POSITION_TYPE);
          if(ptype == POSITION_TYPE_BUY)
@@ -1287,17 +1417,10 @@ void ModifyPosition(TradeCommand &cmd)
             if(tpPts > 0)
                tp = open - tpPts * point;
            }
-         // PositionModify() treats 0 as "remove this level", so carry the
-         // untouched level over from the position to preserve it.
-         if(sl <= 0)
-            sl = PositionGetDouble(POSITION_SL);
-         if(tp <= 0)
-            tp = PositionGetDouble(POSITION_TP);
          trade.PositionModify(ticket, sl, tp);
          lastTradeRetcode = 0;
          lastTradeResult = "MODIFIED " + cmd.symbol;
-         Print("✅ SL/TP modified: ", cmd.symbol, " sl=", slPts, " tp=", tpPts,
-               " (sl_set=", hasSl, " tp_set=", hasTp, ")");
+         Print("✅ SL/TP modified: ", cmd.symbol, " sl=", slPts, " tp=", tpPts);
          return;
         }
      }
@@ -1349,6 +1472,569 @@ void ClosePositionByMagicAndSymbol(string symbol, int magic)
         {
          trade.PositionClose(ticket);
         }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| EscapeJsonString: minimal JSON escaping for feedback payloads      |
+//+------------------------------------------------------------------+
+string EscapeJsonString(string s)
+  {
+   StringReplace(s, "\\", "\\\\");
+   StringReplace(s, "\"", "\\\"");
+   StringReplace(s, "\n", "\\n");
+   StringReplace(s, "\r", "\\r");
+   return s;
+  }
+
+//+------------------------------------------------------------------+
+//| PositionTypeToString: POSITION_TYPE -> stable JSON token           |
+//+------------------------------------------------------------------+
+string PositionTypeToString(long type)
+  {
+   switch((ENUM_POSITION_TYPE)type)
+     {
+      case POSITION_TYPE_BUY:
+         return "buy";
+      case POSITION_TYPE_SELL:
+         return "sell";
+      default:
+         return "unknown";
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| OrderTypeToString: ORDER_TYPE -> stable JSON token                 |
+//+------------------------------------------------------------------+
+string OrderTypeToString(long type)
+  {
+   switch((ENUM_ORDER_TYPE)type)
+     {
+      case ORDER_TYPE_BUY:
+         return "buy";
+      case ORDER_TYPE_SELL:
+         return "sell";
+      case ORDER_TYPE_BUY_LIMIT:
+         return "buy_limit";
+      case ORDER_TYPE_SELL_LIMIT:
+         return "sell_limit";
+      case ORDER_TYPE_BUY_STOP:
+         return "buy_stop";
+      case ORDER_TYPE_SELL_STOP:
+         return "sell_stop";
+      case ORDER_TYPE_BUY_STOP_LIMIT:
+         return "buy_stop_limit";
+      case ORDER_TYPE_SELL_STOP_LIMIT:
+         return "sell_stop_limit";
+      default:
+         return "unknown";
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| OrderStateToString: ORDER_STATE -> stable JSON token               |
+//+------------------------------------------------------------------+
+string OrderStateToString(long state)
+  {
+   switch((ENUM_ORDER_STATE)state)
+     {
+      case ORDER_STATE_STARTED:
+         return "started";
+      case ORDER_STATE_PLACED:
+         return "placed";
+      case ORDER_STATE_PARTIAL:
+         return "partial";
+      case ORDER_STATE_FILLED:
+         return "filled";
+      case ORDER_STATE_CANCELED:
+         return "canceled";
+      case ORDER_STATE_EXPIRED:
+         return "expired";
+      case ORDER_STATE_REJECTED:
+         return "rejected";
+      case ORDER_STATE_REQUEST_ADD:
+         return "request_add";
+      case ORDER_STATE_REQUEST_MODIFY:
+         return "request_modify";
+      case ORDER_STATE_REQUEST_CANCEL:
+         return "request_cancel";
+      default:
+         return "unknown";
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| BuildPositionsJson: all open positions (any magic, magic included) |
+//+------------------------------------------------------------------+
+string BuildPositionsJson()
+  {
+   string out = "[";
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      int digits = (int)SymbolInfoInteger(PositionGetString(POSITION_SYMBOL), SYMBOL_DIGITS);
+      string sym = PositionGetString(POSITION_SYMBOL);
+      if(out != "[")
+         out += ",";
+      out += "{\"ticket\":" + IntegerToString(ticket)
+             + ",\"symbol\":\"" + sym + "\""
+             + ",\"type\":\"" + PositionTypeToString(PositionGetInteger(POSITION_TYPE)) + "\""
+             + ",\"volume\":" + DoubleToString(PositionGetDouble(POSITION_VOLUME), 2)
+             + ",\"open_price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), digits)
+             + ",\"sl\":" + DoubleToString(PositionGetDouble(POSITION_SL), digits)
+             + ",\"tp\":" + DoubleToString(PositionGetDouble(POSITION_TP), digits)
+             + ",\"profit\":" + DoubleToString(PositionGetDouble(POSITION_PROFIT), 2)
+             + ",\"swap\":" + DoubleToString(PositionGetDouble(POSITION_SWAP), 2)
+             + ",\"magic\":" + IntegerToString((long)PositionGetInteger(POSITION_MAGIC))
+             + ",\"comment\":\"" + EscapeJsonString(PositionGetString(POSITION_COMMENT)) + "\"}";
+     }
+   out += "]";
+   return out;
+  }
+
+//+------------------------------------------------------------------+
+//| BuildPendingOrdersJson: all pending orders (magic included)        |
+//+------------------------------------------------------------------+
+string BuildPendingOrdersJson()
+  {
+   string out = "[";
+   int total = OrdersTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0 || !OrderSelect(ticket))
+         continue;
+      string sym = OrderGetString(ORDER_SYMBOL);
+      int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+      string expStr = (exp > 0) ? TimeToString(exp, TIME_DATE | TIME_MINUTES) : "";
+      if(out != "[")
+         out += ",";
+      out += "{\"ticket\":" + IntegerToString(ticket)
+             + ",\"symbol\":\"" + sym + "\""
+             + ",\"type\":\"" + OrderTypeToString(OrderGetInteger(ORDER_TYPE)) + "\""
+             + ",\"state\":\"" + OrderStateToString(OrderGetInteger(ORDER_STATE)) + "\""
+             + ",\"volume\":" + DoubleToString(OrderGetDouble(ORDER_VOLUME_CURRENT), 2)
+             + ",\"price\":" + DoubleToString(OrderGetDouble(ORDER_PRICE_OPEN), digits)
+             + ",\"stoplimit\":" + DoubleToString(OrderGetDouble(ORDER_PRICE_STOPLIMIT), digits)
+             + ",\"sl\":" + DoubleToString(OrderGetDouble(ORDER_SL), digits)
+             + ",\"tp\":" + DoubleToString(OrderGetDouble(ORDER_TP), digits)
+             + ",\"expiration\":\"" + expStr + "\""
+             + ",\"magic\":" + IntegerToString((long)OrderGetInteger(ORDER_MAGIC))
+             + ",\"comment\":\"" + EscapeJsonString(OrderGetString(ORDER_COMMENT)) + "\"}";
+     }
+   out += "]";
+   return out;
+  }
+
+//+------------------------------------------------------------------+
+//| BuildAccountSnapshotJson: one JSON object with account state,      |
+//| open positions and pending orders (used by the "account" action).  |
+//+------------------------------------------------------------------+
+string BuildAccountSnapshotJson()
+  {
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double margin  = AccountInfoDouble(ACCOUNT_MARGIN);
+   double free    = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   long level = (margin > 0.0) ? (long)MathRound(equity / margin * 100.0) : 0;
+   long mm = AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   string marginMode = (mm == (long)ACCOUNT_MARGIN_MODE_EXCHANGE ||
+                        mm == (long)ACCOUNT_MARGIN_MODE_RETAIL_HEDGING) ? "hedging" : "netting";
+   long atm = AccountInfoInteger(ACCOUNT_TRADE_MODE);
+   string accountTradeMode = (atm == (long)ACCOUNT_TRADE_MODE_DEMO)   ? "demo" :
+                             (atm == (long)ACCOUNT_TRADE_MODE_REAL)   ? "real" :
+                             (atm == (long)ACCOUNT_TRADE_MODE_CONTEST) ? "contest" : "unknown";
+
+   string out = "{";
+   out += "\"account\":" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN));
+   out += ",\"name\":\"" + EscapeJsonString(AccountInfoString(ACCOUNT_NAME)) + "\"";
+   out += ",\"server\":\"" + EscapeJsonString(AccountInfoString(ACCOUNT_SERVER)) + "\"";
+   out += ",\"company\":\"" + EscapeJsonString(AccountInfoString(ACCOUNT_COMPANY)) + "\"";
+   out += ",\"currency\":\"" + AccountInfoString(ACCOUNT_CURRENCY) + "\"";
+   out += ",\"margin_mode\":\"" + marginMode + "\"";
+   out += ",\"trade_mode\":\"" + accountTradeMode + "\"";
+   out += ",\"leverage\":" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LEVERAGE));
+   out += ",\"balance\":" + DoubleToString(balance, 2);
+   out += ",\"equity\":" + DoubleToString(equity, 2);
+   out += ",\"margin\":" + DoubleToString(margin, 2);
+   out += ",\"margin_free\":" + DoubleToString(free, 2);
+   out += ",\"margin_level\":" + IntegerToString(level);
+   out += ",\"credit\":" + DoubleToString(AccountInfoDouble(ACCOUNT_CREDIT), 2);
+   out += ",\"profit\":" + DoubleToString(AccountInfoDouble(ACCOUNT_PROFIT), 2);
+   out += ",\"trade_allowed\":" + (AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ? "true" : "false");
+   out += ",\"trade_expert\":" + (MQLInfoInteger(MQL_TRADE_ALLOWED) ? "true" : "false");
+   out += ",\"terminal_connected\":" + (TerminalInfoInteger(TERMINAL_CONNECTED) ? "true" : "false");
+   out += ",\"positions_count\":" + IntegerToString(PositionsTotal());
+   out += ",\"positions\":" + BuildPositionsJson();
+   out += ",\"pending_orders_count\":" + IntegerToString(OrdersTotal());
+   out += ",\"pending_orders\":" + BuildPendingOrdersJson();
+   out += "}";
+   return out;
+  }
+
+//+------------------------------------------------------------------+
+//| NormalizePrice: round to the symbol tick size, then to digits      |
+//+------------------------------------------------------------------+
+double NormalizePrice(string symbol, double price)
+  {
+   double ts = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   if(ts > 0.0)
+      price = MathRound(price / ts) * ts;
+   if(digits >= 0)
+      price = NormalizeDouble(price, digits);
+   return price;
+  }
+
+//+------------------------------------------------------------------+
+//| ParseDatetimeFlexible: "YYYY.MM.DD HH:MM[:SS]" or ISO datetime -  |
+//| builds MqlDateTime manually (no locale-dependent StringToTime).   |
+//| Returns 0 when unparseable so callers keep the broker default.    |
+//+------------------------------------------------------------------+
+datetime ParseDatetimeFlexible(string s)
+  {
+   if(StringLen(s) < 16)
+      return 0;
+   string t = s;
+   StringReplace(t, "T", " ");
+   StringReplace(t, "Z", "");
+   int dash = StringFind(t, "-");
+   int dot = StringFind(t, ".");
+   if(dot < 0 && dash >= 0 && dash < 6)
+      StringReplace(t, "-", ".");   // ISO date -> MT5 "YYYY.MM.DD"
+   string parts[];
+   if(StringSplit(t, (ushort)' ', parts) < 2)
+      return 0;
+   string dp[];
+   if(StringSplit(parts[0], (ushort)'.', dp) != 3)
+      return 0;
+   string tp[];
+   int tpc = StringSplit(parts[1], (ushort)':', tp);
+   if(tpc < 2)
+      return 0;
+   int year  = (int)StringToInteger(dp[0]);
+   int month = (int)StringToInteger(dp[1]);
+   int day   = (int)StringToInteger(dp[2]);
+   int hour  = (int)StringToInteger(tp[0]);
+   int min   = (int)StringToInteger(tp[1]);
+   int sec   = (tpc > 2) ? (int)StringToInteger(tp[2]) : 0;
+   if(year < 2000 || year > 2099 || month < 1 || month > 12 ||
+      day < 1 || day > 31 || hour < 0 || hour > 23 ||
+      min < 0 || min > 59 || sec < 0 || sec > 59)
+      return 0;
+   MqlDateTime dt;
+   dt.year = year;
+   dt.mon  = month;
+   dt.day  = day;
+   dt.hour = hour;
+   dt.min  = min;
+   dt.sec  = sec;
+   dt.day_of_week = 0;
+   dt.day_of_year = 0;
+   return StructToTime(dt);
+  }
+
+//+------------------------------------------------------------------+
+//| PlacePendingOrder: places the 6 pending order types via CTrade.    |
+//| Supports absolute or distance pricing, SL/TP from the order price, |
+//| and optional expiration.                                          |
+//+------------------------------------------------------------------+
+void PlacePendingOrder(TradeCommand &cmd)
+  {
+   string typeName = cmd.orderType;
+   if(typeName == "" || typeName == "pending")
+      typeName = cmd.action;
+   bool isBuyLimit  = (typeName == "buy_limit");
+   bool isSellLimit = (typeName == "sell_limit");
+   bool isBuyStop   = (typeName == "buy_stop");
+   bool isSellStop  = (typeName == "sell_stop");
+   bool isBuySL     = (typeName == "buy_stop_limit");
+   bool isSellSL    = (typeName == "sell_stop_limit");
+   if(!(isBuyLimit || isSellLimit || isBuyStop || isSellStop || isBuySL || isSellSL))
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: invalid pending type";
+      Print("⚠️ Unsupported pending order type: ", typeName);
+      return;
+     }
+   if(SymbolInfoInteger(cmd.symbol, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_FULL)
+     {
+      lastTradeRetcode = -42;
+      lastTradeResult = "SKIPPED: market closed (" + cmd.symbol + ")";
+      Print("⛔ Market closed/trading not allowed for ", cmd.symbol, " - pending skipped.");
+      return;
+     }
+   bool isBuy = (isBuyLimit || isBuyStop || isBuySL);
+   double ask = SymbolInfoDouble(cmd.symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(cmd.symbol, SYMBOL_BID);
+   double point = SymbolInfoDouble(cmd.symbol, SYMBOL_POINT);
+   double base = isBuy ? ask : bid;
+   if(base <= 0.0)
+     {
+      lastTradeRetcode = -42;
+      lastTradeResult = "SKIPPED: no quote for " + cmd.symbol;
+      Print("⛔ No quote for ", cmd.symbol, " - pending skipped.");
+      return;
+     }
+   double price = cmd.price;
+   if(price <= 0.0)
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: price required";
+      Print("⚠️ Pending order needs a price field.");
+      return;
+     }
+   double stopLimit = cmd.stopLimit;
+   if((isBuySL || isSellSL) && stopLimit <= 0.0)
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: stoplimit required";
+      Print("⚠️ Stop-limit order needs a stoplimit field.");
+      return;
+     }
+// "price_unit":"points"/"distance" -> price is a signed offset from the
+// current market (+above / -below); buy measures from Ask, sell from Bid.
+   bool priceInPoints = (cmd.priceUnit == "points" || cmd.priceUnit == "distance");
+   if(priceInPoints)
+     {
+      price = base + price * point;
+      if(stopLimit > 0.0)
+         stopLimit = base + stopLimit * point;
+     }
+   price = NormalizePrice(cmd.symbol, price);
+   if(stopLimit > 0.0)
+      stopLimit = NormalizePrice(cmd.symbol, stopLimit);
+
+   int slPoints = (cmd.hasStopLoss) ? ResolveDistanceToPoints(cmd.symbol, cmd.stopLoss) : 0;
+   int tpPoints = (cmd.hasTakeProfit) ? ResolveDistanceToPoints(cmd.symbol, cmd.takeProfit) : 0;
+   if(slPoints > 0 && slPoints < MinStopDistancePoints)
+      slPoints = MinStopDistancePoints;
+   if(tpPoints > 0 && tpPoints < MinStopDistancePoints)
+      tpPoints = MinStopDistancePoints;
+   double lot = RiskSizePosition(cmd.symbol, cmd, slPoints);
+   if(lot <= 0.0)
+      return;
+// SL/TP are measured from the pending order price, not the market price.
+   double sl = (slPoints > 0) ? (isBuy ? price - slPoints * point : price + slPoints * point) : 0.0;
+   double tp = (tpPoints > 0) ? (isBuy ? price + tpPoints * point : price - tpPoints * point) : 0.0;
+   sl = NormalizePrice(cmd.symbol, sl);
+   tp = NormalizePrice(cmd.symbol, tp);
+
+   datetime expiration = 0;
+   ENUM_ORDER_TYPE_TIME typeTime = ORDER_TIME_GTC;
+   if(cmd.expiration != "")
+     {
+      expiration = ParseDatetimeFlexible(cmd.expiration);
+      if(expiration <= 0)
+        {
+         lastTradeRetcode = -43;
+         lastTradeResult = "SKIPPED: invalid expiration";
+         Print("⚠️ Unparseable expiration: ", cmd.expiration);
+         return;
+        }
+      typeTime = ORDER_TIME_SPECIFIED;
+     }
+
+   bool ok = false;
+   if(isBuyLimit)
+      ok = trade.BuyLimit(lot, price, cmd.symbol, sl, tp, typeTime, expiration, "PENDING_BUY_LIMIT");
+   else
+      if(isSellLimit)
+         ok = trade.SellLimit(lot, price, cmd.symbol, sl, tp, typeTime, expiration, "PENDING_SELL_LIMIT");
+      else
+         if(isBuyStop)
+            ok = trade.BuyStop(lot, price, cmd.symbol, sl, tp, typeTime, expiration, "PENDING_BUY_STOP");
+         else
+            if(isSellStop)
+               ok = trade.SellStop(lot, price, cmd.symbol, sl, tp, typeTime, expiration, "PENDING_SELL_STOP");
+            else
+               ok = trade.OrderOpen(cmd.symbol,
+                                    isBuySL ? ORDER_TYPE_BUY_STOP_LIMIT : ORDER_TYPE_SELL_STOP_LIMIT,
+                                    lot, stopLimit, price, sl, tp, typeTime, expiration,
+                                    isBuySL ? "PENDING_BUY_STOP_LIMIT" : "PENDING_SELL_STOP_LIMIT");
+
+   if(ok)
+     {
+      lastTradeRetcode = 0;
+      lastTradeOrderTicket = trade.ResultOrder();
+      lastTradeResult = "PENDING " + typeName;
+      if(lastTradeOrderTicket > 0)
+         lastTradeResult += " ticket=" + IntegerToString(lastTradeOrderTicket);
+      Print("✅ PENDING ", typeName, " | symbol=", cmd.symbol, " lot=", lot,
+            " price=", price, " slpts=", slPoints, " tppts=", tpPoints);
+     }
+   else
+     {
+      lastTradeRetcode = (int)trade.ResultRetcode();
+      lastTradeResult = "PENDING FAILED";
+      Print("❌ PENDING ", typeName, " FAILED: ", trade.ResultRetcode(), " ", trade.ResultComment());
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| CancelPendingOrder: delete by ticket, or all matching orders for   |
+//| one symbol, or all symbols when cmd.symbol == "*". Magic-filtered. |
+//+------------------------------------------------------------------+
+void CancelPendingOrder(TradeCommand &cmd)
+  {
+   bool allSymbols = (cmd.symbol == "*");
+   if(cmd.orderTicket > 0)
+     {
+      if(!OrderSelect(cmd.orderTicket))
+        {
+         lastTradeRetcode = -41;
+         lastTradeResult = "FAILED: order not found";
+         Print("⚠️ Pending order not found: ", cmd.orderTicket);
+         return;
+        }
+      if((long)OrderGetInteger(ORDER_MAGIC) != MagicNumber)
+        {
+         lastTradeRetcode = -41;
+         lastTradeResult = "FAILED: order not owned by this bot";
+         Print("⚠️ Pending order ", cmd.orderTicket, " has a different magic - refused.");
+         return;
+        }
+      if(trade.OrderDelete(cmd.orderTicket))
+        {
+         lastTradeRetcode = 0;
+         lastTradeResult = "ORDER CANCELED ticket=" + IntegerToString(cmd.orderTicket);
+         Print("✅ Pending order canceled: ", cmd.orderTicket);
+        }
+      else
+        {
+         lastTradeRetcode = (int)trade.ResultRetcode();
+         lastTradeResult = "CANCEL FAILED";
+         Print("❌ Cancel failed: ", trade.ResultRetcode(), " ", trade.ResultComment());
+        }
+      return;
+     }
+   int canceled = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(!OrderSelect(ticket) || (long)OrderGetInteger(ORDER_MAGIC) != MagicNumber)
+         continue;
+      if(allSymbols || OrderGetString(ORDER_SYMBOL) == cmd.symbol)
+        {
+         if(trade.OrderDelete(ticket))
+            canceled++;
+        }
+     }
+   if(canceled > 0)
+     {
+      lastTradeRetcode = 0;
+      lastTradeResult = "CANCELED " + IntegerToString(canceled) + " ORDERS";
+      Print("✅ Pending orders canceled: ", canceled);
+     }
+   else
+     {
+      lastTradeRetcode = -41;
+      lastTradeResult = "FAILED: no matching pending order";
+      Print("⚠️ No matching pending order for ", (cmd.symbol == "*" ? "any symbol" : cmd.symbol));
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| ModifyPendingOrder: change price/SL/TP/expiration of one pending   |
+//| order (by order_ticket, or the first magic+symbol match). Only     |
+//| fields present in the payload are overwritten. Magic-filtered.    |
+//+------------------------------------------------------------------+
+void ModifyPendingOrder(TradeCommand &cmd)
+  {
+   ulong target = cmd.orderTicket;
+   if(target == 0)
+     {
+      for(int i = OrdersTotal() - 1; i >= 0; i--)
+        {
+         ulong ticket = OrderGetTicket(i);
+         if(OrderSelect(ticket) &&
+            (long)OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
+            OrderGetString(ORDER_SYMBOL) == cmd.symbol)
+           {
+            target = ticket;
+            break;
+           }
+        }
+     }
+   if(target == 0 || !OrderSelect(target))
+     {
+      lastTradeRetcode = -41;
+      lastTradeResult = "FAILED: no matching pending order";
+      Print("⚠️ No matching pending order for modify.");
+      return;
+     }
+   if((long)OrderGetInteger(ORDER_MAGIC) != MagicNumber)
+     {
+      lastTradeRetcode = -41;
+      lastTradeResult = "FAILED: order not owned by this bot";
+      Print("⚠️ Pending order ", target, " has a different magic - refused.");
+      return;
+     }
+   long otype = OrderGetInteger(ORDER_TYPE);
+   bool isBuy = (otype == ORDER_TYPE_BUY_LIMIT || otype == ORDER_TYPE_BUY_STOP ||
+                 otype == ORDER_TYPE_BUY_STOP_LIMIT);
+   double curPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+   double curSl = OrderGetDouble(ORDER_SL);
+   double curTp = OrderGetDouble(ORDER_TP);
+   double curStopLimit = OrderGetDouble(ORDER_PRICE_STOPLIMIT);
+   datetime curExp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+   double point = SymbolInfoDouble(cmd.symbol, SYMBOL_POINT);
+
+   double newPrice = (cmd.price > 0.0) ? NormalizePrice(cmd.symbol, cmd.price) : curPrice;
+   double newSl = curSl;
+   double newTp = curTp;
+   if(cmd.hasStopLoss)
+     {
+      int pts = ResolveDistanceToPoints(cmd.symbol, cmd.stopLoss);
+      if(pts > 0 && pts < MinStopDistancePoints)
+         pts = MinStopDistancePoints;
+      newSl = (pts > 0) ? (isBuy ? newPrice - pts * point : newPrice + pts * point) : 0.0;
+     }
+   if(cmd.hasTakeProfit)
+     {
+      int pts = ResolveDistanceToPoints(cmd.symbol, cmd.takeProfit);
+      if(pts > 0 && pts < MinStopDistancePoints)
+         pts = MinStopDistancePoints;
+      newTp = (pts > 0) ? (isBuy ? newPrice + pts * point : newPrice - pts * point) : 0.0;
+     }
+   newSl = NormalizePrice(cmd.symbol, newSl);
+   newTp = NormalizePrice(cmd.symbol, newTp);
+   datetime newExp = curExp;
+   ENUM_ORDER_TYPE_TIME typeTime = (newExp > 0) ? ORDER_TIME_SPECIFIED : ORDER_TIME_GTC;
+   if(cmd.expiration != "")
+     {
+      newExp = ParseDatetimeFlexible(cmd.expiration);
+      if(newExp <= 0)
+        {
+         lastTradeRetcode = -43;
+         lastTradeResult = "SKIPPED: invalid expiration";
+         Print("⚠️ Unparseable expiration: ", cmd.expiration);
+         return;
+        }
+      typeTime = ORDER_TIME_SPECIFIED;
+     }
+
+   if(trade.OrderModify(target, newPrice, newSl, newTp, typeTime, newExp,
+                        (otype == ORDER_TYPE_BUY_STOP_LIMIT || otype == ORDER_TYPE_SELL_STOP_LIMIT) ?
+                        curStopLimit : 0.0))
+     {
+      lastTradeRetcode = 0;
+      lastTradeOrderTicket = target;
+      lastTradeResult = "ORDER MODIFIED ticket=" + IntegerToString(target);
+      Print("✅ Pending order modified: ", target, " price=", newPrice, " sl=", newSl, " tp=", newTp);
+     }
+   else
+     {
+      lastTradeRetcode = (int)trade.ResultRetcode();
+      lastTradeResult = "MODIFY FAILED";
+      Print("❌ Modify pending failed: ", trade.ResultRetcode(), " ", trade.ResultComment());
      }
   }
 

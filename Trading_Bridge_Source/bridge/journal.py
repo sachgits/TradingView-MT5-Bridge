@@ -157,30 +157,33 @@ def extract_journal_command(payload: Dict[str, Any]) -> Dict[str, Any]:
     if lots is not None:
         command["size"] = {"type": "fixed", "unit": "lots", "value": lots}
 
-    # Use the pre-calculated pip_distance from sizing if available - this is more accurate
-    # than calculating from absolute prices since the signal source already did the math
-    pip_distance = as_float(sizing.get("pip_distance"))
-    
-    if pip_distance is not None and stop is not None:
-        # Convert pips to points (1 pip = 10 points for most forex pairs)
-        # This is more reliable than price_distance conversion
-        command["stop_loss"] = {"type": "distance", "unit": "points", "value": round(pip_distance * 10, 1)}
+    # The stop level is the primary data: the gap from the planned entry is
+    # exact, and 'price_distance' lets the EA do the only symbol-specific step
+    # (gap -> points) with SYMBOL_POINT. When the level is absent we fall back
+    # to an explicit atr_context management spec, then to the derived
+    # sizing.pip_distance (rounded, so last choice).
+    stop_loss, sl_error = _absolute_to_gap(entry, stop, is_long, is_stop=True, name="stop", symbol=symbol)
+    if sl_error:
+        return {"error": sl_error}
+    if stop_loss is not None:
+        command["stop_loss"] = stop_loss
     else:
-        # Fallback to absolute price conversion if pip_distance not available
-        stop_loss, sl_error = _absolute_to_gap(entry, stop, is_long, is_stop=True, name="stop", symbol=symbol, safety_margin=0.0)
-        if sl_error:
-            return {"error": sl_error}
-        if stop_loss is not None:
-            command["stop_loss"] = stop_loss
+        atr_sl, atr_warning = _atr_stop(management.get("atr_context"))
+        if atr_warning:
+            warnings.append(atr_warning)
+        if atr_sl is not None:
+            command["stop_loss"] = atr_sl
         else:
-            atr_sl, atr_warning = _atr_stop(management.get("atr_context"))
-            if atr_sl is not None:
-                command["stop_loss"] = atr_sl
-            if atr_warning:
-                warnings.append(atr_warning)
+            pip_distance = as_float(sizing.get("pip_distance"))
+            if pip_distance is not None and pip_distance > 0:
+                command["stop_loss"] = {"type": "distance", "unit": "points", "value": round(pip_distance * 10, 1)}
+                warnings.append(
+                    "journal setup.stop is missing; stop_loss taken from sizing.pip_distance "
+                    "(1 pip = 10 points)"
+                )
 
     # Take profit: only use absolute price conversion (no pip_distance field for TP)
-    take_profit, tp_error = _absolute_to_gap(entry, target, is_long, is_stop=False, name="target", symbol=symbol, safety_margin=0.0)
+    take_profit, tp_error = _absolute_to_gap(entry, target, is_long, is_stop=False, name="target", symbol=symbol)
     if tp_error:
         return {"error": tp_error}
     if take_profit is not None:
@@ -188,18 +191,11 @@ def extract_journal_command(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if entry is not None and entry > 0:
         command["price"] = entry
-        if pip_distance is not None:
-            warnings.append(
-                "journal setup.entry is recorded as price; EA v6.5 ignores price and "
-                "executes entries at market. stop_loss uses sizing.pip_distance converted "
-                "to points; take_profit is converted from planned entry gap"
-            )
-        else:
-            warnings.append(
-                "journal setup.entry is recorded as price; EA v6.5 ignores price and "
-                "executes entries at market. stop_loss/take_profit are converted to "
-                "price_distance from the planned entry gap and applied from the fill"
-            )
+        warnings.append(
+            "journal setup.entry is recorded as price; EA v6.5 ignores price and "
+            "executes entries at market. stop_loss/take_profit are converted to "
+            "price_distance from the planned entry gap and applied from the fill"
+        )
 
     be_block, be_warnings = _breakeven(management.get("breakeven"), command.get("stop_loss"))
     warnings.extend(be_warnings)
@@ -208,11 +204,10 @@ def extract_journal_command(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if management.get("atr_context") is not None and "stop_loss" in command:
         if command["stop_loss"].get("unit") != "atr":
-            sl_unit = command["stop_loss"].get("unit")
-            if sl_unit == "points":
-                warnings.append("journal management.atr_context is ignored because setup.stop is present and converted to points from sizing.pip_distance")
-            else:
-                warnings.append("journal management.atr_context is ignored because setup.stop is present and converted to price_distance")
+            warnings.append(
+                "journal management.atr_context is ignored because setup.stop (or "
+                "sizing.pip_distance) is present and was converted to a distance"
+            )
 
     return _with_notes(command, warnings, identity)
 

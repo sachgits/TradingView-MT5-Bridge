@@ -41,7 +41,7 @@ Produces `dist\Trading_Bridge.exe` (PyInstaller onefile, signal board bundled vi
 
 ## File intake
 
-- Two folders. The **inbox** (default `C:\Trades\signals`) holds commands and is shared with your other producers - the bridge only reads it. The **data folder** (default `C:\Trades\TradingBridge`) is the bridge's own and holds the ledger, `intake/` and `interrupted/`. Set them with `--folder` / `--data` (or `TRADING_BRIDGE_SIGNALS_FOLDER` / `TRADING_BRIDGE_DATA_FOLDER`); the data folder needs a restart, the inbox does not - it is the first field on the board's Settings tab.
+- Two folders. The **inbox** (default `C:\Trades\trade_journal`) holds commands and is shared with your other producers - the bridge only reads it. The **data folder** (default `C:\Trades\TradingBridge`) is the bridge's own and holds the ledger, `intake/` and `interrupted/`. Set them with `--folder` / `--data` (or `TRADING_BRIDGE_SIGNALS_FOLDER` / `TRADING_BRIDGE_DATA_FOLDER`); the data folder needs a restart, the inbox does not - it is the first field on the board's Settings tab.
 - The bridge refuses to start if the two are the same folder, or if either is nested inside the other. The same check rejects a bad inbox typed into the board.
 - When the inbox is switched from the board, every `.json` file already in the new folder is **adopted** - recorded by path and never traded - so pointing the bridge at a folder of history cannot fire a trade per file. A file written after the switch is a normal command.
 - Write to a temporary name and rename to `.json` when complete; the watcher also waits `file_settle_ms` after the last write.

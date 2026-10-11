@@ -253,6 +253,50 @@ def create_app(service: Any) -> Flask:
     def api_metrics():
         return jsonify(service.store.metrics(_int(request.args.get("window"), 3600, 60, 86_400 * 7)))
 
+    @app.route("/api/v1/account", methods=["GET"])
+    def api_account():
+        """The latest EA account/positions snapshot, verbatim, plus its freshness."""
+        return jsonify(service.account_state())
+
+    @app.route("/api/v1/positions", methods=["GET"])
+    def api_positions():
+        """Open positions and pending orders, lifted out of the stored snapshot.
+
+        The bridge never queries MT5 itself - it has no terminal connection - so
+        this is the last snapshot the EA reported. ``age_seconds`` tells the board
+        how stale it is; a closed market or an offline EA simply means an older
+        snapshot, never invented numbers.
+        """
+        state = service.account_state()
+        snapshot = state.get("snapshot") or {}
+        return jsonify({
+            "at": state.get("at"),
+            "age_seconds": state.get("age_seconds"),
+            "in_flight": state.get("in_flight"),
+            "account": snapshot.get("account"),
+            "currency": snapshot.get("currency"),
+            "balance": snapshot.get("balance"),
+            "equity": snapshot.get("equity"),
+            "margin": snapshot.get("margin"),
+            "margin_free": snapshot.get("margin_free"),
+            "margin_level": snapshot.get("margin_level"),
+            "profit": snapshot.get("profit"),
+            "positions": snapshot.get("positions") or [],
+            "positions_count": snapshot.get("positions_count", len(snapshot.get("positions") or [])),
+            "pending_orders": snapshot.get("pending_orders") or [],
+            "pending_orders_count": snapshot.get("pending_orders_count", len(snapshot.get("pending_orders") or [])),
+        })
+
+    @app.route("/api/v1/account/refresh", methods=["POST"])
+    def api_account_refresh():
+        # Read-only, but it does cause a command to be handed to the EA, so it is
+        # guarded like any other intake: a visited web page must not be able to
+        # drive the bridge's poll loop.
+        blocked = guard_intake()
+        if blocked is not None:
+            return blocked
+        return jsonify(service.request_account_refresh())
+
     @app.route("/api/v1/settings", methods=["GET"])
     def api_get_settings():
         return jsonify({

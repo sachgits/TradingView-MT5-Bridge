@@ -33,6 +33,29 @@ def to_ea_timestamp(stored: Optional[str]) -> Optional[str]:
     return text
 
 
+def parse_iso(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 stamp into an aware UTC datetime, or None.
+
+    Journal producers stamp ``...+00:00`` or ``...Z``; a naive stamp is taken as
+    UTC rather than local time, because a freshness check that depends on the
+    machine's timezone would trade or refuse differently after a move.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc)
+
+
 def as_float(value: Any) -> Optional[float]:
     """Coerce to float, returning None when it is not a number.
 

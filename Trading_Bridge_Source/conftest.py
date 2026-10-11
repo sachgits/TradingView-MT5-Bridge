@@ -24,6 +24,9 @@ def settings(tmp_path):
     settings.watch_interval = 0.2
     settings.file_settle_ms = 0
     settings.dedup_window_seconds = 60
+    # Off by default so the trade-dispatch tests see an idle poll when the queue
+    # is empty. The account-snapshot tests enable it explicitly.
+    settings.account_poll_seconds = 0
     return settings
 
 

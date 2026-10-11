@@ -35,9 +35,17 @@ MODE_STRICT = "strict"
 MODE_PERMISSIVE = "permissive"
 VALID_MODES = (MODE_STRICT, MODE_PERMISSIVE)
 
-# Fields that need a symbol to target the right instrument. close_all and noop
-# are account-wide or inert, so they are exempt.
-_SYMBOL_REQUIRED_FOR = contract.ENTRY_ACTIONS | contract.MANAGEMENT_ACTIONS | {"close_symbol", "close_position"}
+# Fields that need a symbol to target the right instrument. close_all, noop and
+# account are account-wide, inert or read-only, so they are exempt. The pending
+# entry types place an order on a specific symbol, so they require one; the
+# pending management actions (cancel/modify) may target an order_ticket instead
+# and are checked separately.
+_SYMBOL_REQUIRED_FOR = (
+    contract.ENTRY_ACTIONS
+    | contract.MANAGEMENT_ACTIONS
+    | contract.PENDING_ACTIONS
+    | {"close_symbol", "close_position"}
+)
 
 
 class Report:
@@ -219,6 +227,125 @@ def _check_take_profits(levels: Any, report: Report) -> None:
         report.warn("ignored by the EA: " + message)
 
 
+def _parse_expiration(value: Any) -> Optional[bool]:
+    """Mirror the EA's ParseDatetimeFlexible: True if it would parse.
+
+    Accepts ISO (``2026-10-31T18:00:00``, trailing ``Z`` ok) or MT5 dot format
+    (``2026.10.31 18:00``). Returns None for a non-string, False when the EA
+    would reject it (retcode -43), True when it parses. Validating here means an
+    unparseable expiry is refused at intake instead of being SKIPPED at the EA.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if len(text) < 16:
+        return False
+    text = text.replace("T", " ").replace("Z", "")
+    if "." not in text and "-" in text and text.index("-") < 6:
+        text = text.replace("-", ".")
+    parts = text.split(" ")
+    if len(parts) < 2:
+        return False
+    date = parts[0].split(".")
+    if len(date) != 3:
+        return False
+    time = parts[1].split(":")
+    if len(time) < 2:
+        return False
+    try:
+        year, month, day = int(date[0]), int(date[1]), int(date[2])
+        hour, minute = int(time[0]), int(time[1])
+        second = int(time[2]) if len(time) > 2 else 0
+    except ValueError:
+        return False
+    return (2000 <= year <= 2099 and 1 <= month <= 12 and 1 <= day <= 31
+            and 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59)
+
+
+def _check_expiration(value: Any, report: Report) -> None:
+    if value is None:
+        return
+    parsed = _parse_expiration(value)
+    if parsed is None:
+        report.error("expiration must be a string (ISO '2026-10-31T18:00:00' or MT5 '2026.10.31 18:00')")
+    elif parsed is False:
+        report.error(
+            f"expiration '{value}' is not parseable by the EA; use ISO "
+            "'2026-10-31T18:00:00' or MT5 '2026.10.31 18:00' (absent = GTC)"
+        )
+
+
+def _check_positive_int(value: Any, name: str, report: Report) -> None:
+    numeric = as_float(value)
+    if numeric is None or numeric <= 0 or numeric != int(numeric):
+        report.error(f"{name} must be a positive integer")
+
+
+def _check_pending_entry(command: Dict[str, Any], report: Report, strict: bool, is_legacy: bool, action: str) -> None:
+    """Validate a pending-order placement (the six types, or action 'pending')."""
+    order_type = command.get("order_type")
+    if action == "pending":
+        if not order_type:
+            report.error(
+                "action 'pending' requires an order_type: "
+                + ", ".join(sorted(contract.PENDING_ENTRY_ACTIONS))
+            )
+            return
+        resolved = contract.normalize_action(order_type)
+        if resolved not in contract.PENDING_ENTRY_ACTIONS:
+            report.error(
+                f"order_type '{order_type}' is not a pending type; use "
+                + ", ".join(sorted(contract.PENDING_ENTRY_ACTIONS))
+            )
+            return
+    else:
+        resolved = action
+        if order_type and contract.normalize_action(order_type) != resolved:
+            report.warn(
+                f"order_type '{order_type}' is ignored; the action '{action}' decides the pending type"
+            )
+
+    _check_size(command, report, strict, is_legacy)
+    _check_distance(command.get("stop_loss"), "stop_loss", report)
+    _check_distance(command.get("take_profit"), "take_profit", report)
+    if command.get("stop_loss") is not None or command.get("take_profit") is not None:
+        report.warn("a pending order's SL/TP are measured from the order price, not the market price")
+
+    price_unit = str(command.get("price_unit") or contract.PRICE_UNIT_ABSOLUTE).strip().lower()
+    if price_unit not in contract.PRICE_UNITS:
+        report.error(
+            f"price_unit '{price_unit}' is unknown; the EA accepts "
+            + ", ".join(sorted(contract.PRICE_UNITS))
+        )
+    price = command.get("price")
+    numeric = as_float(price)
+    if price is None:
+        report.error(
+            "a pending order requires a price: an absolute trigger price, or a signed "
+            "distance from market when price_unit is 'points'"
+        )
+    elif numeric is None:
+        report.error("price must be numeric")
+    elif price_unit in contract.PRICE_UNIT_DISTANCE:
+        if numeric == 0:
+            report.error(
+                "price 0 with price_unit 'points' would sit at the market; use an absolute "
+                "price or a non-zero signed offset"
+            )
+    elif numeric <= 0:
+        report.error("an absolute pending price must be greater than zero")
+
+    if resolved in contract.STOP_LIMIT_ACTIONS:
+        stoplimit = command.get("stoplimit")
+        sl_numeric = as_float(stoplimit)
+        if stoplimit is None:
+            report.error(f"{resolved} requires a stoplimit (the inner limit price)")
+        elif sl_numeric is None or sl_numeric <= 0:
+            report.error("stoplimit must be a price greater than zero")
+
+    _check_expiration(command.get("expiration"), report)
+
+
 def validate_command(command: Dict[str, Any], mode: str = MODE_STRICT) -> Dict[str, Any]:
     """Validate a normalized command. Returns {valid, errors, warnings}."""
     report = Report()
@@ -273,6 +400,46 @@ def validate_command(command: Dict[str, Any], mode: str = MODE_STRICT) -> Dict[s
         _check_size(command, report, strict, is_legacy)
         _check_distance(command.get("stop_loss"), "stop_loss", report)
         _check_distance(command.get("take_profit"), "take_profit", report)
+
+    if action in contract.PENDING_ACTIONS:
+        _check_pending_entry(command, report, strict, is_legacy, action)
+
+    if action == "cancel_pending":
+        # The EA cancels by order_ticket, or by symbol + magic when no ticket is
+        # given. Symbol "*" (or omitted with a ticket) is the account-wide case.
+        if not command.get("order_ticket") and not symbol:
+            report.error("cancel_pending requires an order_ticket or a symbol")
+        if command.get("order_ticket") is not None:
+            _check_positive_int(command.get("order_ticket"), "order_ticket", report)
+
+    if action == "modify_pending":
+        if not command.get("order_ticket") and not symbol:
+            report.error("modify_pending requires an order_ticket or a symbol")
+        if command.get("order_ticket") is not None:
+            _check_positive_int(command.get("order_ticket"), "order_ticket", report)
+        # A modify that changes nothing is a mistake, not a no-op to forward.
+        touches_price = command.get("price") is not None
+        touches_sl = command.get("stop_loss") is not None
+        touches_tp = command.get("take_profit") is not None
+        touches_expiry = command.get("expiration") is not None
+        if not (touches_price or touches_sl or touches_tp or touches_expiry):
+            report.error(
+                "modify_pending requires at least one of price, stop_loss, "
+                "take_profit or expiration"
+            )
+        if touches_price:
+            price_numeric = as_float(command.get("price"))
+            price_unit = str(command.get("price_unit") or contract.PRICE_UNIT_ABSOLUTE).strip().lower()
+            if price_numeric is None:
+                report.error("price must be numeric")
+            elif price_unit in contract.PRICE_UNIT_DISTANCE:
+                if price_numeric == 0:
+                    report.error("price 0 with price_unit 'points' would not move the order")
+            elif price_numeric <= 0:
+                report.error("an absolute pending price must be greater than zero")
+        _check_distance(command.get("stop_loss"), "stop_loss", report)
+        _check_distance(command.get("take_profit"), "take_profit", report)
+        _check_expiration(command.get("expiration"), report)
 
     if action == "partial_close":
         percent = as_float(command.get("close_percent"))
@@ -334,12 +501,16 @@ def validate_command(command: Dict[str, Any], mode: str = MODE_STRICT) -> Dict[s
             )
 
     price = command.get("price")
-    if price is not None:
+    if price is not None and action in contract.ENTRY_ACTIONS:
+        # A market buy/sell executes at the current price, so a stated price is
+        # carried for the record but never used as a limit. Pending orders are
+        # validated separately (_check_pending_entry) and legitimately use price,
+        # including signed distances, so they are excluded here.
         numeric = as_float(price)
-        if numeric is None or numeric <= 0:
-            report.error("price must be a number greater than zero")
-        else:
-            report.warn("price is ignored by EA v6.5; entries are always executed at market")
+        if numeric is None:
+            report.error("price must be numeric")
+        elif not (command.get("_meta") or {}).get("is_journal"):
+            report.warn("price is ignored for a market entry; EA v6.5 executes buy/sell at market")
 
     for extra in (command.get("_meta") or {}).get("warnings", []):
         report.warn(extra)

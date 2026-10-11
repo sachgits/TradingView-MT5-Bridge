@@ -66,6 +66,11 @@ _KNOWN_PASSTHROUGH = (
     "expiration",
     "comment",
     "client",
+    # EA v6.5 pending-order engine fields.
+    "order_type",
+    "price_unit",
+    "stoplimit",
+    "order_ticket",
 )
 
 
@@ -87,6 +92,27 @@ def _coerce_numeric(value: Any) -> Any:
     """
     number = as_float(value)
     return number if number is not None else value
+
+
+def _fold_alias(result: Dict[str, Any], canonical: str, aliases: tuple, *, integer: bool = False) -> None:
+    """Promote the first present alias onto ``canonical`` and drop the rest.
+
+    The EA reads these keys with an unscoped substring scan and tries its own
+    aliases in order, so leaving two spellings in the body risks it picking the
+    stale one. Folding to a single canonical key mirrors what normalization
+    already does for size and SL/TP.
+    """
+    name, value = _first_present(result, aliases)
+    if name is None:
+        return
+    if integer:
+        number = as_float(value)
+        result[canonical] = int(number) if number is not None else value
+    else:
+        result[canonical] = _coerce_numeric(value)
+    for alias in aliases:
+        if alias != canonical:
+            result.pop(alias, None)
 
 
 def normalize_size(value: Any) -> Dict[str, Any]:
@@ -175,6 +201,20 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         for key in keys:
             if key in block:
                 block[key] = normalize_distance(block[key])
+
+    # --- pending-order engine fields (EA v6.5) -----------------------------
+    # Fold each sender alias onto the canonical key the EA reads, drop the
+    # alias, and canonicalize order_type/price_unit so validation and dedup see
+    # one stable spelling. Only touches keys the sender actually supplied - a
+    # market order carries none of these and gains none.
+    _fold_alias(result, "price", contract.PRICE_ALIASES)
+    _fold_alias(result, "stoplimit", contract.STOPLIMIT_ALIASES)
+    _fold_alias(result, "order_ticket", contract.ORDER_TICKET_ALIASES, integer=True)
+    _fold_alias(result, "expiration", contract.EXPIRATION_ALIASES)
+    if result.get("order_type") is not None:
+        result["order_type"] = contract.normalize_action(result["order_type"])
+    if result.get("price_unit") is not None:
+        result["price_unit"] = str(result["price_unit"]).strip().lower()
 
     # --- unknown fields ----------------------------------------------------
     # Semantic problems (an unresolvable unit, an approximate size mode, a

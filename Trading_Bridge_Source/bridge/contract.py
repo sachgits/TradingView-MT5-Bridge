@@ -34,6 +34,17 @@ ACTION_ALIASES: dict[str, tuple[str, ...]] = {
     "modify": ("modify", "modify_stop", "set_sltp", "update_sltp"),
     "breakeven": ("breakeven", "be", "move_be", "break_even"),
     "noop": ("hold", "hold_position", "none", "noop", "wait", "trend", "wait_for"),
+    # v6.5: read-only account snapshot and the pending-order engine.
+    "account": ("account", "status", "snapshot", "account_info", "info"),
+    "pending": ("pending", "place_pending", "pending_order", "open_pending"),
+    "buy_limit": ("buy_limit", "buylimit"),
+    "sell_limit": ("sell_limit", "selllimit"),
+    "buy_stop": ("buy_stop", "buystop"),
+    "sell_stop": ("sell_stop", "sellstop"),
+    "buy_stop_limit": ("buy_stop_limit", "buystoplimit"),
+    "sell_stop_limit": ("sell_stop_limit", "sellstoplimit"),
+    "cancel_pending": ("cancel_pending", "cancel_order", "delete_order", "delete_pending"),
+    "modify_pending": ("modify_pending", "modify_order", "update_order", "update_pending"),
 }
 
 # ExecuteTradeCommand() also matches "close_position" directly. It is not
@@ -46,20 +57,35 @@ CLOSE_ACTIONS: frozenset[str] = frozenset({"close_symbol", "close_position", "cl
 MANAGEMENT_ACTIONS: frozenset[str] = frozenset({"partial_close", "modify", "breakeven"})
 NOOP_ACTIONS: frozenset[str] = frozenset({"noop"})
 
+# v6.5 additions, grouped by what the validator needs to check for each.
+# ACCOUNT_ACTIONS is a pure state query: the EA builds a snapshot and never
+# submits an order, so it needs no symbol and no size and works even when
+# trading is disabled or the market is closed.
+ACCOUNT_ACTIONS: frozenset[str] = frozenset({"account"})
+# The six direct pending-order types. PlacePendingOrder() resolves the type
+# from order_type, falling back to the action name itself.
+PENDING_ENTRY_ACTIONS: frozenset[str] = frozenset({
+    "buy_limit", "sell_limit", "buy_stop", "sell_stop", "buy_stop_limit", "sell_stop_limit",
+})
+# "pending" places an order too, but the type comes from an explicit order_type.
+PENDING_ACTIONS: frozenset[str] = PENDING_ENTRY_ACTIONS | {"pending"}
+# Stop-limit types additionally require an inner stoplimit price.
+STOP_LIMIT_ACTIONS: frozenset[str] = frozenset({"buy_stop_limit", "sell_stop_limit"})
+PENDING_MANAGEMENT_ACTIONS: frozenset[str] = frozenset({"cancel_pending", "modify_pending"})
+
 # Actions the previous bridge schema accepted but the EA does not implement.
 # Each one reaches ExecuteTradeCommand(), falls through every branch, and is
 # reported as SKIPPED with retcode -13 - a trade silently not placed. They are
 # rejected at intake so the sender learns immediately instead of after the
 # fact. Remove an entry here once the EA implements it.
+#
+# The six pending-order types and cancel/modify_pending were here until EA v6.5
+# implemented them; they are now real actions (see PENDING_ACTIONS above).
 SKIPPED_ACTIONS: dict[str, str] = {
-    "buy_limit": "pending orders are not implemented by the EA",
-    "sell_limit": "pending orders are not implemented by the EA",
-    "buy_stop": "pending orders are not implemented by the EA",
-    "sell_stop": "pending orders are not implemented by the EA",
     "close_positions": "use close_all (plural is not an EA action)",
     "modify_position": "use modify",
     "reverse": "not implemented by the EA",
-    "close_pending": "not implemented by the EA",
+    "close_pending": "use cancel_pending",
 }
 
 _ALIAS_TO_CANONICAL: dict[str, str] = {
@@ -119,6 +145,56 @@ DEFAULT_ATR_MULTIPLIER = 1.0
 ATR_TIMEFRAME_HONOURED = False
 
 # --------------------------------------------------------------------------
+# Pending-order engine (EA v6.5)
+# --------------------------------------------------------------------------
+# PlacePendingOrder() reads cmd.priceUnit: "price" (default) treats cmd.price as
+# an absolute trigger price; "points"/"distance" treat it as a SIGNED offset from
+# the current market (+above / -below; buy measures from Ask, sell from Bid).
+PRICE_UNITS: frozenset[str] = frozenset({"price", "points", "distance"})
+PRICE_UNIT_ABSOLUTE = "price"
+PRICE_UNIT_DISTANCE: frozenset[str] = frozenset({"points", "distance"})
+
+# Fields the pending engine reads, beyond action/symbol/size/stop_loss/take_profit.
+# Each is preserved by normalization and validated per-action by the validator.
+PENDING_FIELDS: tuple[str, ...] = (
+    "order_type",     # canonical pending type when action == "pending"
+    "price",          # absolute trigger price, or a signed distance when price_unit says so
+    "price_unit",     # "price" | "points" | "distance"
+    "stoplimit",      # inner limit price, required for the two stop-limit types
+    "order_ticket",   # target order for cancel_pending / modify_pending
+    "expiration",     # "YYYY.MM.DD HH:MM" or ISO datetime; absent = GTC
+)
+
+# Sender spellings the EA folds into "stoplimit" and "order_ticket"; normalized
+# to the canonical key so the EA's unscoped substring scan cannot miss them.
+STOPLIMIT_ALIASES: tuple[str, ...] = ("stoplimit", "stop_limit", "limit_price")
+ORDER_TICKET_ALIASES: tuple[str, ...] = ("order_ticket", "ticket")
+EXPIRATION_ALIASES: tuple[str, ...] = ("expiration", "expiry")
+PRICE_ALIASES: tuple[str, ...] = ("price", "entry")
+
+# --------------------------------------------------------------------------
+# Account snapshot (EA v6.5 "account" action)
+# --------------------------------------------------------------------------
+# BuildAccountSnapshotJson() returns this object in the ack's "snapshot" field.
+# The bridge stores the latest one verbatim and serves it to the board; it never
+# invents or reinterprets a value, so the key list is documentation only.
+SNAPSHOT_ACCOUNT_KEYS: tuple[str, ...] = (
+    "account", "name", "server", "company", "currency", "margin_mode",
+    "trade_mode", "leverage", "balance", "equity", "margin", "margin_free",
+    "margin_level", "credit", "profit", "trade_allowed", "trade_expert",
+    "terminal_connected", "positions_count", "positions",
+    "pending_orders_count", "pending_orders",
+)
+SNAPSHOT_POSITION_KEYS: tuple[str, ...] = (
+    "ticket", "symbol", "type", "volume", "open_price", "sl", "tp",
+    "profit", "swap", "magic", "comment",
+)
+SNAPSHOT_PENDING_KEYS: tuple[str, ...] = (
+    "ticket", "symbol", "type", "state", "volume", "price", "stoplimit",
+    "sl", "tp", "expiration", "magic", "comment",
+)
+
+# --------------------------------------------------------------------------
 # Outcomes reported by the EA
 # --------------------------------------------------------------------------
 # ReportSignalResult() sets status from the sign of the retcode.
@@ -140,6 +216,11 @@ LOCAL_RETCODES: dict[int, str] = {
     -30: "no matching open position for partial_close",
     -31: "no matching open position for modify",
     -32: "no matching open position for breakeven",
+    # v6.5 pending-order engine guards.
+    -40: "invalid pending params (type, price or stoplimit missing)",
+    -41: "no matching pending order, or not owned by this bot's magic",
+    -42: "market closed or no quote for pending placement",
+    -43: "unparseable expiration",
 }
 
 # Common broker retcodes, for labelling the histogram on the signal board.
@@ -258,6 +339,10 @@ RESULT_FIELDS: tuple[str, ...] = (
     "result",
 )
 
+# v6.5 appends these to the ack only when relevant: the ticket of a placed or
+# modified pending order, and the full account snapshot for an "account" action.
+RESULT_EXTRA_FIELDS: tuple[str, ...] = ("order_ticket", "snapshot")
+
 # EA input names, so the dashboard can label what the operator configured.
 EA_INPUTS: tuple[str, ...] = (
     "LotSize",
@@ -340,6 +425,15 @@ def public_contract() -> dict:
         "entry_actions": sorted(ENTRY_ACTIONS),
         "close_actions": sorted(CLOSE_ACTIONS),
         "management_actions": sorted(MANAGEMENT_ACTIONS),
+        "account_actions": sorted(ACCOUNT_ACTIONS),
+        "pending_actions": sorted(PENDING_ACTIONS),
+        "stop_limit_actions": sorted(STOP_LIMIT_ACTIONS),
+        "pending_management_actions": sorted(PENDING_MANAGEMENT_ACTIONS),
+        "pending_fields": list(PENDING_FIELDS),
+        "price_units": sorted(PRICE_UNITS),
+        "snapshot_account_keys": list(SNAPSHOT_ACCOUNT_KEYS),
+        "snapshot_position_keys": list(SNAPSHOT_POSITION_KEYS),
+        "snapshot_pending_keys": list(SNAPSHOT_PENDING_KEYS),
         "unsupported_actions": SKIPPED_ACTIONS,
         "size_units": sorted(SIZE_UNITS),
         "approximate_size_units": sorted(APPROXIMATE_SIZE_UNITS),

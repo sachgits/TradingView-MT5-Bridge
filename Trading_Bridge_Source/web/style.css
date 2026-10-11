@@ -201,6 +201,8 @@ main { padding: 18px 20px 60px; max-width: 1680px; margin: 0 auto; }
 .table td { padding: 7px 9px; border-bottom: 1px solid #1a222b; vertical-align: top; }
 .table tbody tr:hover { background: #161d25; }
 .table .num { text-align: right; font-family: var(--mono); }
+.table .num.pos { color: var(--accent); }
+.table .num.neg { color: var(--red); }
 .table code, .mono { font-family: var(--mono); font-size: 11.5px; }
 
 .pager { display: flex; gap: 10px; align-items: center; justify-content: center; padding-top: 12px; color: var(--text-dim); font-family: var(--mono); font-size: 12px; }

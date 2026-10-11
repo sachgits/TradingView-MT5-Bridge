@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,7 +36,7 @@ from . import contract, events, schema, validator
 from .config import MUTABLE, Settings, mutable_view
 from .events import EventBus
 from .store import RETRYABLE_STATUSES, Store
-from .util import content_hash, to_ea_timestamp, utc_now
+from .util import content_hash, parse_iso, to_ea_timestamp, utc_now
 
 # Bot_Trader polls every PollIntervalMs (750 ms by default) and acknowledges in
 # the same request, so anything much longer than a few polls means it stopped.
@@ -90,6 +91,14 @@ class Service:
         self._lock = threading.RLock()
         self._watcher: Any = None
         self._ea_online: Optional[bool] = None
+        # Account-snapshot polling state. _account_inflight_at is the monotonic
+        # time an "account" request was handed to the EA (None when nothing is
+        # outstanding); it stops the bridge re-asking on every 750 ms poll while
+        # a snapshot is still coming back. _account_force is set by an on-demand
+        # refresh so the next poll injects one regardless of age.
+        self._account_inflight_at: Optional[float] = None
+        self._account_request_id: Optional[str] = None
+        self._account_force = False
         self._restore_settings()
 
     # ---------------------------------------------------------------- wiring
@@ -170,6 +179,9 @@ class Service:
 
         rid = self._new_request_id(request_id or command.get("request_id"))
         report = validator.validate_command(command, self.settings.validation_mode)
+        stale = self._journal_stale_error(command)
+        if stale is not None:
+            report = dict(report, valid=False, errors=list(report["errors"]) + [stale])
         # The validator folds normalization's structural notes (_meta.warnings)
         # into its own report, so this is the complete list.
         warnings = list(report["warnings"])
@@ -366,19 +378,28 @@ class Service:
         self._expire_overdue()
 
         if self.settings.paused:
+            # Pause means nothing at all is handed to the EA - not even a
+            # read-only snapshot. The board keeps showing the last stored one.
             return self._idle_envelope("paused")
 
+        # A real order always takes the poll. Only when nothing is waiting does
+        # the bridge spend the poll on a read-only account snapshot, so the
+        # positions view can never delay a trade.
         row = self.store.claim_next()
-        if row is None:
-            return self._idle_envelope()
+        if row is not None:
+            command = row["command"] if isinstance(row["command"], dict) else {}
+            self.emit(
+                events.SIGNAL_DISPATCHED,
+                row["request_id"],
+                {"summary": schema.summarize(command), "queue_ms": row.get("queue_ms")},
+            )
+            return self._build_envelope(row, command)
 
-        command = row["command"] if isinstance(row["command"], dict) else {}
-        self.emit(
-            events.SIGNAL_DISPATCHED,
-            row["request_id"],
-            {"summary": schema.summarize(command), "queue_ms": row.get("queue_ms")},
-        )
-        return self._build_envelope(row, command)
+        account = self._account_envelope_if_due()
+        if account is not None:
+            return account
+
+        return self._idle_envelope()
 
     def _idle_envelope(self, reason: str = "") -> Dict[str, Any]:
         envelope = {
@@ -416,6 +437,113 @@ class Service:
             "signal": json.dumps(for_ea, separators=(",", ":"), default=str),
         }
 
+    # -------------------------------------------------- account snapshot poll
+    def _account_snapshot_stale(self, interval: int) -> bool:
+        """True when the stored snapshot is older than ``interval`` seconds."""
+        _, at = self.store.load_account_snapshot()
+        if not at:
+            return True
+        when = parse_iso(at)
+        if when is None:
+            return True
+        age = (datetime.now(timezone.utc) - when).total_seconds()
+        return age >= interval
+
+    def _account_envelope_if_due(self) -> Optional[Dict[str, Any]]:
+        """Build an ``account`` request envelope, or None if one is not due.
+
+        The EA dedups on the *entire* response body, so each request carries a
+        fresh request_id and timestamp - otherwise a second ``{"action":"account"}``
+        would be byte-identical to the last and silently skipped. An outstanding
+        request blocks a new one until it is acked or times out, which is what
+        keeps a 750 ms poll loop from asking for a snapshot every tick.
+        """
+        interval = max(0, int(self.settings.account_poll_seconds))
+        timeout = max(self.settings.dispatch_timeout_seconds, 5)
+        with self._lock:
+            now = time.monotonic()
+            if self._account_inflight_at is not None:
+                if now - self._account_inflight_at >= timeout:
+                    # The EA never answered the last ask (it may have gone
+                    # offline). Stop waiting so a fresh one can be sent.
+                    self._account_inflight_at = None
+                elif not self._account_force:
+                    return None
+            if not self._account_force:
+                if interval == 0 or not self._account_snapshot_stale(interval):
+                    return None
+            self._account_force = False
+            self._account_inflight_at = now
+            request_id = self._new_request_id(None)
+            self._account_request_id = request_id
+
+        command = {"action": "account"}
+        for_ea = public_command(command)
+        return {
+            "status": contract.ENVELOPE_NEW,
+            "request_id": request_id,
+            "timestamp": utc_now(),
+            "source": "bridge",
+            "source_file": "",
+            "normalized": for_ea,
+            "signal": json.dumps(for_ea, separators=(",", ":"), default=str),
+        }
+
+    def request_account_refresh(self) -> Dict[str, Any]:
+        """Ask for a snapshot on the EA's next poll, ignoring the age gate.
+
+        Does not build the envelope here: the EA only ever receives a command by
+        polling, so this sets a flag that the next ``ea_poll`` acts on. The board
+        then sees the new snapshot arrive over SSE or its next state poll.
+        """
+        with self._lock:
+            self._account_force = True
+        return {"ok": True, "note": "an account snapshot will be requested on the EA's next poll"}
+
+    def account_state(self) -> Dict[str, Any]:
+        """The latest stored snapshot plus how fresh it is, for the API/board."""
+        snapshot, at = self.store.load_account_snapshot()
+        age = None
+        if at:
+            when = parse_iso(at)
+            if when is not None:
+                age = round(max(0.0, (datetime.now(timezone.utc) - when).total_seconds()), 1)
+        with self._lock:
+            in_flight = self._account_inflight_at is not None
+        return {
+            "snapshot": snapshot,
+            "at": at,
+            "age_seconds": age,
+            "poll_seconds": self.settings.account_poll_seconds,
+            "in_flight": in_flight,
+        }
+
+    def _handle_account_ack(self, body: Dict[str, Any], request_id: str) -> Dict[str, Any]:
+        """Store an ``account`` snapshot ack. It is not a signal: no ledger row.
+
+        The EA answers an account request with retcode 0 and a ``snapshot``
+        object. There is no matching row in the signals table (the bridge never
+        inserted one), so this path deliberately avoids record_result - which
+        would be a no-op anyway - and keeps the snapshot out of the trade ledger.
+        """
+        snapshot = body.get("snapshot")
+        stored = isinstance(snapshot, dict) and bool(snapshot)
+        if stored:
+            self.store.store_account_snapshot(snapshot)
+        with self._lock:
+            # Clear the outstanding flag only for the request we are waiting on,
+            # so a late or duplicate ack cannot mask a still-pending ask.
+            if request_id and request_id == self._account_request_id:
+                self._account_inflight_at = None
+        detail = {
+            "stored": stored,
+            "account": snapshot.get("account") if stored else None,
+            "positions_count": snapshot.get("positions_count") if stored else None,
+            "pending_orders_count": snapshot.get("pending_orders_count") if stored else None,
+        }
+        self.emit(events.ACCOUNT_SNAPSHOT, None, detail)
+        return {"ok": True, "account": True, "request_id": request_id, "stored": stored}
+
     def ea_ack(self, body: Any) -> Dict[str, Any]:
         """Record the outcome Bot_Trader POSTs to ``ProcessedURL``.
 
@@ -442,6 +570,12 @@ class Service:
         if not request_id:
             self.emit(events.SIGNAL_RESULT, None, {"error": "acknowledgement carried no request_id", "body": body})
             return {"ok": False, "error": "request_id is required"}
+
+        # An account snapshot is transient state, not a trade: it has no ledger
+        # row and must never create one. Detected by the snapshot payload the EA
+        # attaches, or by the action it echoes back.
+        if isinstance(body.get("snapshot"), dict) or contract.normalize_action(body.get("action")) == "account":
+            return self._handle_account_ack(body, request_id)
 
         row = self.store.get_signal(request_id)
         ack_status = str(body.get("status") or "").strip().upper()
@@ -549,6 +683,7 @@ class Service:
             "editable_settings": mutable_view(),
             "ea": self.ea_state(),
             "queue_depth": self.store.queue_depth(),
+            "account": self.account_state(),
             "metrics": self.store.metrics(metrics_window),
             "signals": [self._public_signal(s) for s in self.store.list_signals(limit=limit)],
             "events": self.store.list_events(since_id=since_event, limit=200),
@@ -616,6 +751,9 @@ class Service:
                 "summary": "",
             }
         report = validator.validate_command(command, self.settings.validation_mode)
+        stale = self._journal_stale_error(command)
+        if stale is not None:
+            report = dict(report, valid=False, errors=list(report["errors"]) + [stale])
         warnings = list(report["warnings"]) + schema.shadowing_risk(command)
         return {
             "valid": report["valid"],
@@ -627,6 +765,32 @@ class Service:
             "mode": self.settings.validation_mode,
             "envelope": self._preview_envelope(command),
         }
+
+    def _journal_stale_error(self, command: Dict[str, Any]) -> Optional[str]:
+        """Refuse a journal entry whose trigger stamp is old.
+
+        The journal's own ``lifecycle.triggered_at`` is the authority on when the
+        setup fired; this only judges freshness, never the trade parameters. A
+        record written at trigger time reaches the bridge within a second or two,
+        so anything older than the limit is history sitting in a shared inbox -
+        and history must not become a burst of market orders.
+        """
+        meta = command.get("_meta")
+        if not isinstance(meta, dict) or not meta.get("is_journal"):
+            return None
+        limit = max(0, int(self.settings.journal_max_age_seconds))
+        if limit == 0:
+            return None
+        when = parse_iso(command.get("timestamp"))
+        if when is None:
+            return None
+        age = (datetime.now(timezone.utc) - when).total_seconds()
+        if age <= limit:
+            return None
+        return (
+            f"journal trigger {command.get('timestamp')} is {int(age)}s old, older than "
+            f"journal_max_age_seconds ({limit}): a stale trigger is history, not an order"
+        )
 
     def _preview_envelope(self, command: Dict[str, Any]) -> Dict[str, Any]:
         """The exact bytes the EA would receive, for on-screen comparison.

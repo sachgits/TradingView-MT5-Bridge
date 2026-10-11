@@ -28,6 +28,8 @@ By using this software, you accept full and sole responsibility for all trading 
 - ✅ **100% FREE** - no TradingView Premium, no webhooks, no cloud VPS, no subscription
 - ✅ **Three input methods** - Chrome extension, HTTP API, or JSON files dropped in a folder
 - ✅ **A signal board, not a log window** - every command, dispatch, acknowledgement, retcode and latency figure is stored in a SQLite ledger and streamed to `http://127.0.0.1:8080/`
+- ✅ **Live account view** - a Positions tab pulls balance, equity, margin, open positions and pending orders straight from MT5 (the EA reports a snapshot on an idle poll) and shows them in the browser
+- ✅ **Pending orders** - `buy_stop`, `buy_limit`, `sell_stop`, `sell_limit`, `buy_stop_limit`, `sell_stop_limit`, `cancel_pending` and `modify_pending`, with absolute or signed-distance entry prices and expirations
 - ✅ **Idempotent by design** - a command is never dispatched twice, even across a bridge restart
 - ✅ **Auditable file intake** - the signal folder is read-only: files are copied into the bridge's own data folder and the copy is marked `.processed` / `.rejected` / `.invalid`. Nothing in the shared folder is renamed or deleted, and you can point the bridge at a different folder from the board without restarting
 - ✅ **Production server** - Waitress WSGI, thread-safe queue, bounded SSE streams
@@ -77,10 +79,11 @@ Then open **http://127.0.0.1:8080/** - that is the signal board.
 4. Site settings → allow **Local Network Access** for tradingview.com
 
 **🔹 JSON files (custom bots)**
-1. Write commands to the inbox (default `C:\Trades\signals`). It is **read-only** to the bridge: your files are never renamed, marked or deleted
+1. Write commands to the inbox (default `C:\Trades\trade_journal`). It is **read-only** to the bridge: your files are never renamed, marked or deleted
 2. Each one is copied into the data folder (default `C:\Trades\TradingBridge\intake`) and the copy is marked `.processed`, `.rejected`, `.invalid` or `.interrupted`
 3. What has already been consumed is remembered in the ledger, so a file left in the inbox cannot produce a second trade
-4. See [FILE_IO_GUIDE.md](FILE_IO_GUIDE.md)
+4. Trade-journal records (`pair`/`direction`/`setup`) are recognised and reduced to a lean EA command; a record whose trigger is older than `journal_max_age_seconds` is refused as history rather than traded. See [FILE_IO_GUIDE.md → Trade-journal records](FILE_IO_GUIDE.md#trade-journal-records)
+5. See [FILE_IO_GUIDE.md](FILE_IO_GUIDE.md)
 
 **🔹 HTTP API** - `POST /api/v1/signals` with any command Bot_Trader accepts (see below).
 
@@ -99,9 +102,10 @@ Then open **http://127.0.0.1:8080/** - that is the signal board.
 |---|---|
 | **Board** | KPI cards (total / executed / failed / skipped / waiting / rejected / expired), throughput chart, outcome mix, by-symbol and by-action bars, latency percentiles, retcode histogram, live event feed |
 | **Signals** | The full ledger with search and status/symbol/action filters; click a row for the detail drawer with the command, the raw payload, the EA's acknowledgement and the event timeline |
+| **Positions** | The live account snapshot the EA reported: balance / equity / margin / free-margin / margin-level KPIs, plus a table of open positions and one of pending orders, each with its own P/L. **Refresh** forces a new snapshot on the next idle poll |
 | **Events** | Every event the bridge emitted, newest first, with follow-along scrolling |
 | **Send** | Compose a command, validate it dry-run (same checks as a real submission, writes nothing), preview the exact envelope the EA will receive, then send |
-| **Settings** | Watch interval, file settle time, intake on/off, validation mode, queue depth, signal TTL, dedup window, dispatch timeout, pause, origin check - saved and applied live |
+| **Settings** | Watch interval, file settle time, intake on/off, validation mode, queue depth, signal TTL, dedup window, dispatch timeout, account snapshot interval, pause, origin check - saved and applied live. Typed values survive the board's background refresh; the form is only rebuilt when you save or discard |
 | **EA contract** | What Bot_Trader v6.5 actually implements: executed actions, skipped actions, size and distance units, inputs, envelope keys, retcode tables |
 
 The board updates over Server-Sent Events. If a stream cannot be opened (too many tabs, or a proxy that buffers), it falls back to polling automatically - every event is durable in the ledger either way, so nothing is missed.
@@ -124,10 +128,11 @@ Anything Bot_Trader v6.5 accepts is accepted here. Legacy plain-text signals (`B
 }
 ```
 
-- **Actions:** `buy`, `sell`, `close_position`, `close_all`, `partial_close`, `modify`, `breakeven`, `hold`
+- **Actions:** market `buy`, `sell`; management `close_position`, `close_all`, `partial_close`, `modify`, `breakeven`, `hold`; pending `buy_stop`, `buy_limit`, `sell_stop`, `sell_limit`, `buy_stop_limit`, `sell_stop_limit`, `cancel_pending`, `modify_pending`; plus `account` for a read-only snapshot
 - **Size:** `lots`, `percent`, `risk_percent`-style risk sizing via `risk_percent`; units the EA cannot honour exactly are reported as warnings, never guessed
 - **Distances:** `points`, `pips`, `price_distance`, `price`, `atr` (ATR timeframe is parsed but the EA uses its chart timeframe - flagged as a warning)
-- **Aliases** accepted and canonicalized: `lot`/`volume`/`qty`, `sl`/`stoploss`, `tp`/`takeprofit`, and legacy keyword text
+- **Pending entry:** `order_type` (implied by the action), `price` with `price_unit` (`price` absolute, `points`/`distance` signed offset from Ask/Bid), `stoplimit` for the stop-limit pair, `expiration` (ISO or MT5 datetime), and SL/TP measured from the *order* price. `cancel_pending` / `modify_pending` target an `order_ticket`, or a symbol + the bot's magic
+- **Aliases** accepted and canonicalized: `lot`/`volume`/`qty`, `sl`/`stoploss`, `tp`/`takeprofit`, `entry`/`stop_limit`/`ticket`/`expiry`, and legacy keyword text
 
 The bridge **never invents a trade parameter**. If a size, symbol or stop is missing where the EA would substitute its own input, strict validation refuses the command instead of letting the EA guess.
 
@@ -153,7 +158,7 @@ Full field reference: [AUDIT_AND_COMMANDS.md](AUDIT_AND_COMMANDS.md).
 `GET /signal` · `POST /signal/processed` · `POST /signal` (legacy) · `POST /signal/clear` · `GET /health`
 
 **Operator / API:**
-`GET|POST /api/v1/signals` · `GET /api/v1/signals/<id>` · `POST /api/v1/signals/<id>/cancel|retry|requeue` · `POST /api/v1/validate` · `GET /api/v1/events` · `GET /api/v1/metrics` · `GET|PATCH /api/v1/settings` · `GET /api/v1/contract` · `GET /api/v1/watcher` · `GET /api/v1/state` · `POST /api/v1/rescan` · `GET /api/v1/stream` (SSE)
+`GET|POST /api/v1/signals` · `GET /api/v1/signals/<id>` · `POST /api/v1/signals/<id>/cancel|retry|requeue` · `POST /api/v1/validate` · `GET /api/v1/events` · `GET /api/v1/metrics` · `GET|PATCH /api/v1/settings` · `GET /api/v1/contract` · `GET /api/v1/watcher` · `GET /api/v1/state` · `POST /api/v1/rescan` · `GET /api/v1/account` · `GET /api/v1/positions` · `POST /api/v1/account/refresh` · `GET /api/v1/stream` (SSE)
 
 ---
 
@@ -169,7 +174,7 @@ Full field reference: [AUDIT_AND_COMMANDS.md](AUDIT_AND_COMMANDS.md).
 
 ```powershell
 python -m pip install -r Trading_Bridge_Source/requirements.txt
-python -m pytest Trading_Bridge_Source/tests      # 89 tests: contract, schema, store, service, watcher, HTTP
+python -m pytest Trading_Bridge_Source/tests      # 167 tests: contract, schema, store, service, watcher, pending/account, HTTP
 powershell -File build.ps1                          # PyInstaller onefile + distributable zip
 ```
 

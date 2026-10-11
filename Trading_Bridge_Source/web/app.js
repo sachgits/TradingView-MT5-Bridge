@@ -30,6 +30,12 @@ const state = {
   pollTimer: null,
   refreshTimer: null,
   drawerId: null,
+  // Settings form lifecycle. The periodic refresh must not rebuild the form out
+  // from under an operator who is mid-edit, so the inputs are built once and
+  // only re-synced from the server while the form is clean.
+  settingsBuilt: false,
+  settingsSpecKey: "",
+  settingsDirty: false,
 };
 
 const POLL_INTERVAL_MS = 1500;
@@ -125,6 +131,7 @@ function showView(name) {
   if (name === "signals") loadSignals();
   if (name === "events") renderEventsFeed();
   if (name === "settings") renderSettings();
+  if (name === "positions") renderPositions();
   if (name === "board") renderBoard();
 }
 
@@ -328,6 +335,133 @@ function renderBoardFeed() {
   const list = $("#board-feed");
   clear(list);
   for (const event of state.events.slice(-24).reverse()) list.appendChild(eventRow(event));
+}
+
+/* --------------------------------------------------------------- positions */
+
+/* The account view is read-only state the EA reported, so a missing snapshot is
+ * not an error to hide - it means the EA has not answered an account request yet
+ * (offline, or the queue has not been empty long enough to ask). */
+function renderPositions() {
+  const snap = state.snapshot;
+  if (!snap) return;
+  const account = snap.account || {};
+  const data = account.snapshot || null;
+  const note = $("#account-note");
+
+  if (!data) {
+    note.textContent = account.in_flight
+      ? "· waiting for the EA to report…"
+      : "· no snapshot yet — the EA reports one when the trade queue is empty";
+    renderAccountKpis(null, account);
+    const pbody = $("#positions-table tbody");
+    const qbody = $("#pending-table tbody");
+    clear(pbody); clear(qbody);
+    pbody.appendChild(h("tr", {}, h("td", { colspan: "11", class: "empty", text: "No account data yet." })));
+    qbody.appendChild(h("tr", {}, h("td", { colspan: "11", class: "empty", text: "No account data yet." })));
+    $("#badge-positions").textContent = "0";
+    $("#badge-pending").textContent = "0";
+    return;
+  }
+
+  note.textContent = `· ${data.account ?? "?"} · ${data.server || ""} · updated ${ago(account.age_seconds)}`
+    + (account.in_flight ? " · refreshing…" : "");
+  renderAccountKpis(data, account);
+
+  const positions = data.positions || [];
+  const pending = data.pending_orders || [];
+  $("#badge-positions").textContent = String(data.positions_count ?? positions.length);
+  $("#badge-pending").textContent = String(data.pending_orders_count ?? pending.length);
+
+  const pbody = $("#positions-table tbody");
+  clear(pbody);
+  if (!positions.length) {
+    pbody.appendChild(h("tr", {}, h("td", { colspan: "11", class: "empty", text: "No open positions." })));
+  }
+  for (const p of positions) {
+    const profit = Number(p.profit || 0);
+    pbody.appendChild(h("tr", {},
+      h("td", { class: "mono", text: String(p.ticket ?? "") }),
+      h("td", { text: String(p.symbol ?? "") }),
+      h("td", {}, h("span", { class: `tag ${p.type === "buy" ? "executed" : "failed"}`, text: String(p.type ?? "") })),
+      h("td", { class: "num", text: number(p.volume, 2) }),
+      h("td", { class: "num", text: number(p.open_price, 5) }),
+      h("td", { class: "num", text: p.sl ? number(p.sl, 5) : "—" }),
+      h("td", { class: "num", text: p.tp ? number(p.tp, 5) : "—" }),
+      h("td", { class: "num", text: number(p.swap, 2) }),
+      h("td", { class: `num ${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}`, text: number(profit, 2) }),
+      h("td", { class: "num mono", text: String(p.magic ?? "") }),
+      h("td", { class: "mono", text: String(p.comment ?? ""), title: String(p.comment ?? "") })));
+  }
+
+  const qbody = $("#pending-table tbody");
+  clear(qbody);
+  if (!pending.length) {
+    qbody.appendChild(h("tr", {}, h("td", { colspan: "11", class: "empty", text: "No pending orders." })));
+  }
+  for (const o of pending) {
+    qbody.appendChild(h("tr", {},
+      h("td", { class: "mono", text: String(o.ticket ?? "") }),
+      h("td", { text: String(o.symbol ?? "") }),
+      h("td", { class: "mono", text: String(o.type ?? "") }),
+      h("td", { text: String(o.state ?? "") }),
+      h("td", { class: "num", text: number(o.volume, 2) }),
+      h("td", { class: "num", text: number(o.price, 5) }),
+      h("td", { class: "num", text: o.stoplimit ? number(o.stoplimit, 5) : "—" }),
+      h("td", { class: "num", text: o.sl ? number(o.sl, 5) : "—" }),
+      h("td", { class: "num", text: o.tp ? number(o.tp, 5) : "—" }),
+      h("td", { class: "mono", text: o.expiration ? String(o.expiration) : "GTC" }),
+      h("td", { class: "num mono", text: String(o.magic ?? "") })));
+  }
+}
+
+function renderAccountKpis(data, account) {
+  const box = $("#account-kpis");
+  clear(box);
+  if (!data) {
+    box.appendChild(h("div", { class: "kpi" },
+      h("div", { class: "kpi-value", text: "—" }),
+      h("div", { class: "kpi-label", text: "No account data" }),
+      h("div", { class: "kpi-sub", text: "Is Bot_Trader attached and polling?" })));
+    return;
+  }
+  const currency = data.currency || "";
+  const money = (value) => `${number(value, 2)}${currency ? " " + currency : ""}`;
+  const cards = [
+    { label: "Balance", value: money(data.balance), sub: data.trade_mode || "" },
+    { label: "Equity", value: money(data.equity), sub: `leverage 1:${number(data.leverage)}` },
+    { label: "Floating P/L", value: money(data.profit), cls: Number(data.profit || 0) >= 0 ? "executed" : "failed" },
+    { label: "Free margin", value: money(data.margin_free), sub: `level ${number(data.margin_level, 0)}%` },
+    { label: "Margin used", value: money(data.margin), sub: `${data.margin_mode || ""}` },
+    { label: "Positions", value: number(data.positions_count), sub: `${number(data.pending_orders_count)} pending` },
+  ];
+  for (const c of cards) {
+    box.appendChild(h("div", { class: `kpi ${c.cls || ""}` },
+      h("div", { class: "kpi-value", text: c.value }),
+      h("div", { class: "kpi-label", text: c.label }),
+      c.sub ? h("div", { class: "kpi-sub", text: c.sub }) : null));
+  }
+  const flags = [];
+  if (data.terminal_connected === false) flags.push("terminal offline");
+  if (data.trade_allowed === false) flags.push("trading not allowed");
+  if (data.trade_expert === false) flags.push("expert trading off");
+  if (flags.length) {
+    box.appendChild(h("div", { class: "kpi failed", title: flags.join(", ") },
+      h("div", { class: "kpi-value", text: "!" }),
+      h("div", { class: "kpi-label", text: flags[0] })));
+  }
+}
+
+async function refreshAccount() {
+  try {
+    await api("/api/v1/account/refresh", { method: "POST" });
+    toast("Account snapshot requested — it arrives on the EA's next poll", "info");
+    // The EA polls every ~750 ms and answers in the same request; give it a
+    // moment, then pull the new snapshot rather than waiting for the 5 s timer.
+    setTimeout(() => { refreshState(); }, 1600);
+  } catch (error) {
+    toast(`Could not request a snapshot: ${error.message}`, "bad");
+  }
 }
 
 /* ----------------------------------------------------------------- events */
@@ -566,6 +700,14 @@ function templates() {
     modify: { action: "modify", symbol: "EURUSD", stop_loss: { unit: "points", value: 250 } },
     breakeven: { action: "breakeven", symbol: "EURUSD", breakeven: { lock_in: { unit: "points", value: 20 } } },
     hold: { action: "hold", symbol: "EURUSD" },
+    // v6.5 pending-order engine. price is the trigger; price_unit "points" makes
+    // it a signed offset from market instead of an absolute price.
+    buy_stop: { action: "buy_stop", symbol: "EURUSD", size: { value: 0.01, unit: "lots" }, price: 1.0950, stop_loss: points, take_profit: { type: "distance", unit: "points", value: 400 } },
+    sell_limit: { action: "sell_limit", symbol: "EURUSD", size: { value: 0.01, unit: "lots" }, price: -120, price_unit: "points", expiration: "2026-12-31T23:59:00" },
+    buy_stop_limit: { action: "buy_stop_limit", symbol: "XAUUSD", size: { value: 0.05, unit: "lots" }, price: 2650.0, stoplimit: 2648.0 },
+    cancel_pending: { action: "cancel_pending", order_ticket: 12345678 },
+    modify_pending: { action: "modify_pending", order_ticket: 12345678, price: 1.0975 },
+    account: { action: "account" },
     legacy_text: { signal: "BUY SL=50 TP=100 LOT=0.01" },
   };
 }
@@ -670,14 +812,32 @@ async function sendDraft() {
 
 /* --------------------------------------------------------------- settings */
 
-function renderSettings() {
+function renderSettings(force = false) {
   const snap = state.snapshot;
   if (!snap) return;
-  const form = $("#settings-form");
   const editable = snap.editable_settings || {};
   const current = snap.settings || {};
-  clear(form);
+  const specKey = Object.keys(editable).join(",");
 
+  // Rebuild the inputs only when they do not exist yet, the editable set changed
+  // (a bridge upgrade), or the caller explicitly asked (after Save/Discard).
+  // Otherwise an in-progress edit - and the cursor in it - survives the refresh.
+  if (force || !state.settingsBuilt || state.settingsSpecKey !== specKey) {
+    buildSettingsForm(editable, current);
+    state.settingsBuilt = true;
+    state.settingsSpecKey = specKey;
+    state.settingsDirty = false;
+  } else if (!state.settingsDirty) {
+    // Clean form: reflect a server-side change (e.g. a pause toggle from the
+    // top bar) without disturbing anything the operator has typed.
+    syncSettingsInputs(current);
+  }
+  renderSettingsInfo(snap);
+}
+
+function buildSettingsForm(editable, current) {
+  const form = $("#settings-form");
+  clear(form);
   for (const [name, spec] of Object.entries(editable)) {
     const field = h("div", { class: "field" });
     field.appendChild(h("div", { class: "field-head" },
@@ -710,12 +870,36 @@ function renderSettings() {
         input.classList.add("field-path");
       }
     }
-    input.addEventListener("change", () => { $(`#current-${name}`).textContent = input.value; });
+    // Any keystroke marks the form dirty so the periodic refresh leaves it
+    // alone; the value label mirrors what the operator will save.
+    const markDirty = () => {
+      state.settingsDirty = true;
+      const label = $(`#current-${name}`);
+      if (label) label.textContent = input.value;
+    };
+    input.addEventListener("input", markDirty);
+    input.addEventListener("change", markDirty);
     field.appendChild(input);
     field.appendChild(h("div", { class: "field-error", id: `error-${name}` }));
     form.appendChild(field);
   }
+}
 
+function syncSettingsInputs(current) {
+  for (const name of Object.keys(current)) {
+    const input = $(`#setting-${name}`);
+    if (!input) continue;
+    const server = String(current[name]);
+    // Guard on equality: assigning .value even to the same string can reset the
+    // caret in a focused field, and the refresh runs on a timer.
+    if (input.value !== server) input.value = server;
+    const label = $(`#current-${name}`);
+    if (label) label.textContent = server;
+  }
+}
+
+function renderSettingsInfo(snap) {
+  const current = snap.settings || {};
   const info = [
     ["Inbox (read-only)", snap.watcher ? snap.watcher.folder : current.signals_folder],
     ["Inbox exists", snap.watcher ? String(snap.watcher.folder_exists) : "—"],
@@ -803,7 +987,7 @@ async function saveSettings() {
   box.appendChild(h("div", { class: "result-banner ok", text: "Saved. Effective immediately and kept across restarts." }));
   toast("Settings saved", "ok");
   await refreshState();
-  renderSettings();
+  renderSettings(true);
 }
 
 /* --------------------------------------------------------------- contract */
@@ -992,6 +1176,7 @@ async function doRefreshState() {
     pushEvents(state.snapshot.events || []);
     renderTopBar();
     if ($("#view-board").classList.contains("is-active")) renderBoard();
+    if ($("#view-positions").classList.contains("is-active")) renderPositions();
     if ($("#view-settings").classList.contains("is-active")) renderSettings();
   } catch (error) {
     setPill("#pill-connection", "server unreachable", "bad", error.message);
@@ -1087,7 +1272,8 @@ function wire() {
   });
 
   $("#btn-save-settings").addEventListener("click", saveSettings);
-  $("#btn-reload-settings").addEventListener("click", () => { renderSettings(); clear($("#settings-result")); });
+  $("#btn-reload-settings").addEventListener("click", () => { renderSettings(true); clear($("#settings-result")); });
+  $("#btn-refresh-account").addEventListener("click", refreshAccount);
 
   window.addEventListener("resize", () => {
     if ($("#view-board").classList.contains("is-active") && state.snapshot) {

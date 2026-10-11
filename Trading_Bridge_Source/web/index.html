@@ -34,6 +34,7 @@
 
 <nav class="tabs" id="tabs">
   <button class="tab is-active" data-view="board">Board</button>
+  <button class="tab" data-view="positions">Positions</button>
   <button class="tab" data-view="signals">Signals <span class="badge" id="badge-signals">0</span></button>
   <button class="tab" data-view="events">Events <span class="badge" id="badge-events">0</span></button>
   <button class="tab" data-view="send">Send</button>
@@ -84,6 +85,57 @@
       <div class="panel">
         <h2>Live events</h2>
         <ul class="feed" id="board-feed"></ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================= POSITIONS -->
+  <section class="view" id="view-positions">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Account <span class="panel-note" id="account-note"></span></h2>
+        <div class="filters">
+          <button class="btn btn-small" id="btn-refresh-account">Refresh now</button>
+        </div>
+      </div>
+      <p class="panel-note">
+        Read-only state reported by the EA's <code>account</code> action, requested only when the
+        trade queue is empty so it can never delay an order. The bridge has no terminal connection
+        of its own: these are the last numbers Bot_Trader sent, never values it invented.
+      </p>
+      <div class="kpis" id="account-kpis"></div>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h2>Open positions <span class="badge" id="badge-positions">0</span></h2>
+        <div class="table-wrap">
+          <table class="table" id="positions-table">
+            <thead>
+              <tr>
+                <th>Ticket</th><th>Symbol</th><th>Type</th><th class="num">Volume</th>
+                <th class="num">Open</th><th class="num">SL</th><th class="num">TP</th>
+                <th class="num">Swap</th><th class="num">Profit</th><th class="num">Magic</th><th>Comment</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Pending orders <span class="badge" id="badge-pending">0</span></h2>
+        <div class="table-wrap">
+          <table class="table" id="pending-table">
+            <thead>
+              <tr>
+                <th>Ticket</th><th>Symbol</th><th>Type</th><th>State</th><th class="num">Volume</th>
+                <th class="num">Price</th><th class="num">StopLimit</th><th class="num">SL</th>
+                <th class="num">TP</th><th>Expiration</th><th class="num">Magic</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </section>
