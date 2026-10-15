@@ -173,6 +173,20 @@ def _check_size(command: Dict[str, Any], report: Report, strict: bool, is_legacy
         elif not 0 < risk_percent <= 100:
             report.error("risk_percent must be greater than 0 and no more than 100")
 
+    if unit in ("risk_money", "risk_cash", "risk_amount", "risk_usd"):
+        if value <= 0:
+            report.error(f"size.value must be greater than zero when size.unit is '{unit}'")
+        if command.get("stop_loss") is None:
+            if strict:
+                report.error(
+                    f"stop_loss is required in strict mode when size.unit is '{unit}' "
+                    "so the EA can calculate lot size from risk money"
+                )
+            else:
+                report.warn(
+                    f"stop_loss omitted with size.unit '{unit}'; the EA's LotSize input will be used"
+                )
+
     if unit in contract.APPROXIMATE_SIZE_UNITS:
         report.warn(
             f"size.unit '{unit}' is a documented approximation in the EA, not exact risk math"
@@ -386,7 +400,10 @@ def validate_command(command: Dict[str, Any], mode: str = MODE_STRICT) -> Dict[s
     symbol = command.get("symbol")
     if action in _SYMBOL_REQUIRED_FOR:
         if not symbol:
-            if strict and not is_legacy:
+            if action in ("close_position", "partial_close", "modify", "breakeven", "trailing") and command.get("position_ticket"):
+                # Position actions can target a specific position_ticket directly
+                pass
+            elif strict and not is_legacy:
                 report.error(
                     "symbol is required in strict mode - without it the EA trades "
                     "its own chart symbol, which may not be the intended instrument"
@@ -442,8 +459,12 @@ def validate_command(command: Dict[str, Any], mode: str = MODE_STRICT) -> Dict[s
         _check_expiration(command.get("expiration"), report)
 
     if action == "partial_close":
+        close_volume = as_float(command.get("close_volume"))
         percent = as_float(command.get("close_percent"))
-        if percent is None:
+        if close_volume is not None:
+            if close_volume <= 0:
+                report.error("close_volume must be greater than 0")
+        elif percent is None:
             report.warn("close_percent omitted; the EA closes 100% of the position")
         elif not 0 < percent <= 100:
             report.error("close_percent must be greater than 0 and no more than 100")
@@ -457,15 +478,8 @@ def validate_command(command: Dict[str, Any], mode: str = MODE_STRICT) -> Dict[s
         _check_distance(command.get("take_profit"), "take_profit", report)
 
     if action == "close_position":
-        # The EA closes by symbol + magic, not by ticket; a ticket is accepted
-        # for sender convenience but is not what drives the close.
         if not symbol and not command.get("position_ticket"):
             report.error("close_position requires a symbol or position_ticket")
-        if command.get("position_ticket"):
-            report.warn(
-                "position_ticket is accepted but EA v6.5 closes by symbol and magic "
-                "number, not by ticket"
-            )
 
     if action == "breakeven":
         breakeven = command.get("breakeven")
@@ -473,13 +487,22 @@ def validate_command(command: Dict[str, Any], mode: str = MODE_STRICT) -> Dict[s
             lock_in = breakeven.get("lock_in")
             if lock_in is not None:
                 _check_distance(lock_in, "breakeven.lock_in", report)
-            if breakeven.get("trigger") is not None:
-                report.warn("breakeven.trigger is parsed but not enforced; the SL moves immediately")
+            trigger = breakeven.get("trigger")
+            if trigger is not None:
+                _check_distance(trigger, "breakeven.trigger", report)
         else:
-            report.warn("breakeven without a lock_in uses the EA's 20-point default")
+            report.warn("breakeven without a lock_in uses the EA's 10-point default")
 
-    if command.get("trailing") is not None:
-        report.warn("trailing is parsed but not executed by EA v6.5; it will be ignored")
+    if action == "trailing":
+        trailing = command.get("trailing")
+        if isinstance(trailing, dict):
+            if trailing.get("distance") is not None:
+                _check_distance(trailing.get("distance"), "trailing.distance", report)
+            if trailing.get("activation") is not None:
+                _check_distance(trailing.get("activation"), "trailing.activation", report)
+
+    if action != "trailing" and command.get("trailing") is not None:
+        report.warn("trailing on entry is recorded; send action 'trailing' to advance trailing stop")
 
     if command.get("take_profits") is not None:
         _check_take_profits(command["take_profits"], report)

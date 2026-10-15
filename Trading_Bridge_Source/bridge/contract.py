@@ -18,7 +18,7 @@ anything the EA executes but the bridge rejects is an unreachable feature.
 
 from __future__ import annotations
 
-EA_VERSION = "6.5"
+EA_VERSION = "6.6"
 SCHEMA_VERSION = "2.1"
 
 # --------------------------------------------------------------------------
@@ -45,6 +45,8 @@ ACTION_ALIASES: dict[str, tuple[str, ...]] = {
     "sell_stop_limit": ("sell_stop_limit", "sellstoplimit"),
     "cancel_pending": ("cancel_pending", "cancel_order", "delete_order", "delete_pending"),
     "modify_pending": ("modify_pending", "modify_order", "update_order", "update_pending"),
+    # v6.6: trailing stop execution
+    "trailing": ("trailing", "trailing_stop", "trail"),
 }
 
 # ExecuteTradeCommand() also matches "close_position" directly. It is not
@@ -54,7 +56,7 @@ EXECUTED_ACTIONS: frozenset[str] = frozenset(ACTION_ALIASES) | {"close_position"
 
 ENTRY_ACTIONS: frozenset[str] = frozenset({"buy", "sell"})
 CLOSE_ACTIONS: frozenset[str] = frozenset({"close_symbol", "close_position", "close_all"})
-MANAGEMENT_ACTIONS: frozenset[str] = frozenset({"partial_close", "modify", "breakeven"})
+MANAGEMENT_ACTIONS: frozenset[str] = frozenset({"partial_close", "modify", "breakeven", "trailing"})
 NOOP_ACTIONS: frozenset[str] = frozenset({"noop"})
 
 # v6.5 additions, grouped by what the validator needs to check for each.
@@ -112,8 +114,17 @@ def is_executed(action: str) -> bool:
 # Position sizing
 # --------------------------------------------------------------------------
 # RiskSizePosition() branches on these. "currency" is an alias for "money".
-SIZE_UNITS: frozenset[str] = frozenset({"lots", "percent", "risk", "money", "currency"})
-SIZE_UNIT_ALIASES: dict[str, str] = {"currency": "money"}
+# v6.6 adds "risk_money" (cash risk sizing in account currency) and aliases.
+SIZE_UNITS: frozenset[str] = frozenset({
+    "lots", "percent", "risk", "money", "currency",
+    "risk_money", "risk_cash", "risk_amount", "risk_usd",
+})
+SIZE_UNIT_ALIASES: dict[str, str] = {
+    "currency": "money",
+    "risk_cash": "risk_money",
+    "risk_amount": "risk_money",
+    "risk_usd": "risk_money",
+}
 
 # Units whose lot calculation is a documented approximation rather than exact
 # risk math (see the RiskSizePosition() header comment). Surfaced on the
@@ -221,6 +232,8 @@ LOCAL_RETCODES: dict[int, str] = {
     -41: "no matching pending order, or not owned by this bot's magic",
     -42: "market closed or no quote for pending placement",
     -43: "unparseable expiration",
+    # v6.6 parse and symbol guard.
+    -50: "unparseable command or invalid symbol rejected locally",
 }
 
 # Common broker retcodes, for labelling the histogram on the signal board.
@@ -339,9 +352,16 @@ RESULT_FIELDS: tuple[str, ...] = (
     "result",
 )
 
-# v6.5 appends these to the ack only when relevant: the ticket of a placed or
-# modified pending order, and the full account snapshot for an "account" action.
-RESULT_EXTRA_FIELDS: tuple[str, ...] = ("order_ticket", "snapshot")
+# v6.5 & v6.6 appends these to the ack only when relevant: the tickets and fill
+# prices/volumes for executions, pending orders, and the full account snapshot.
+RESULT_EXTRA_FIELDS: tuple[str, ...] = (
+    "order_ticket",
+    "position_ticket",
+    "deal_ticket",
+    "filled_price",
+    "filled_volume",
+    "snapshot",
+)
 
 # EA input names, so the dashboard can label what the operator configured.
 EA_INPUTS: tuple[str, ...] = (

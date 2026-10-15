@@ -23,6 +23,25 @@ def drop(settings, name, payload):
     return path
 
 
+def age_mtime(path, delta_ns=2_000_000):
+    """Make a rewrite's mtime distinct from the original, but still in the past.
+
+    The watcher fast-skips a file whose (size, mtime_ns) still matches the
+    register, so a rewrite that changes the content hash but not the byte length
+    (EURUSD -> XAUUSD) is only told apart by its mtime. Two writes inside one
+    filesystem timestamp tick collide and the new command is skipped.
+
+    The mtime is pushed *backwards*, not forwards: with file_settle_ms=0 the
+    scan skips a file whose mtime is in the future (now - mtime < 0), so aging
+    it keeps the file settled while guaranteeing a distinct signature. Real
+    producers write seconds apart; this models that deterministically instead of
+    depending on the OS clock tick.
+    """
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns - delta_ns))
+    return path
+
+
 def inbox_names(settings):
     return sorted(p.name for p in settings.signals_folder.iterdir())
 
@@ -95,7 +114,10 @@ def test_rewriting_the_same_name_with_new_content_is_a_new_command(service, sett
     drop(settings, "trade.json", BUY)
     watcher = watcher_for(service, settings)
     watcher.scan_once()
-    drop(settings, "trade.json", {**BUY, "symbol": "XAUUSD"})
+    # XAUUSD is the same byte length as EURUSD, so only the content hash and the
+    # mtime distinguish this rewrite; age the mtime so the stat fast-path sees
+    # a changed file (see age_mtime).
+    age_mtime(drop(settings, "trade.json", {**BUY, "symbol": "XAUUSD"}))
     results = watcher.scan_once()
     assert len(results) == 1
     assert store.queue_depth() == 2

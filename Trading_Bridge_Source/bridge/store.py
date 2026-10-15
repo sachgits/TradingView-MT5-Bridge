@@ -29,7 +29,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from . import contract
 from .util import to_ea_timestamp, utc_now
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Timestamps are stored with SQLite's own datetime('now') so that every
 # comparison against datetime('now', '-N seconds') and every strftime() bucket
@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS signals (
     error          TEXT,
     retcode        INTEGER,
     result_text    TEXT,
+    result_extra   TEXT,
     created_at     TEXT    NOT NULL,
     dispatched_at  TEXT,
     finished_at    TEXT,
@@ -163,7 +164,7 @@ class DuplicateSignal(Exception):
 
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     data = dict(row)
-    for key in ("command", "raw_payload", "warnings"):
+    for key in ("command", "raw_payload", "warnings", "result_extra"):
         if key in data and isinstance(data[key], str):
             try:
                 data[key] = json.loads(data[key])
@@ -205,11 +206,24 @@ class Store:
     def _initialize(self) -> None:
         with self._init_lock:
             conn = self._conn
-            conn.executescript(_SCHEMA)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
+            conn.executescript(_SCHEMA)
+            if version < 4:
+                # v4 adds signals.result_extra: the broker-object fields the EA
+                # v6.6 returns on an ack (position/deal ticket, fill price and
+                # volume, order ticket). CREATE TABLE IF NOT EXISTS will not add
+                # a column to an operator's existing ledger, so ALTER it in.
+                self._ensure_column(conn, "signals", "result_extra", "TEXT")
             if version < SCHEMA_VERSION:
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+        """Idempotent ADD COLUMN: a fresh DB already has it from _SCHEMA."""
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         conn = getattr(_LOCAL, "conn", None)
@@ -447,6 +461,7 @@ class Store:
         error: Optional[str] = None,
         retcode: Optional[int] = None,
         result_text: Optional[str] = None,
+        result_extra: Optional[str] = None,
         stamp_dispatched: bool = False,
         stamp_finished: bool = False,
     ) -> bool:
@@ -461,6 +476,9 @@ class Store:
         if result_text is not None:
             sets.append("result_text = ?")
             args.append(result_text)
+        if result_extra is not None:
+            sets.append("result_extra = ?")
+            args.append(result_extra)
         if stamp_dispatched:
             # SET expressions read the pre-update row, so the latency is
             # computed from datetime('now') rather than the column just written.
@@ -642,13 +660,23 @@ class Store:
         status: str,
         retcode: Optional[int],
         result_text: Optional[str],
+        result_extra: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Store the EA's ReportSignalResult ack."""
+        """Store the EA's ReportSignalResult ack.
+
+        ``result_extra`` carries the broker-object fields EA v6.6 attaches to an
+        execution (position/deal ticket, fill price and volume, order ticket) so
+        the ledger can tie a command to the position it actually opened. Stored
+        as one JSON blob: it is audit data read back whole, never queried by
+        column, so a blob keeps the schema stable as the EA's ack grows.
+        """
+        extra_json = json.dumps(result_extra, default=str) if result_extra else None
         return self.set_status(
             request_id,
             status,
             retcode=retcode,
             result_text=result_text,
+            result_extra=extra_json,
             stamp_finished=True,
         )
 

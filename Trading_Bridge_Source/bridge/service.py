@@ -593,8 +593,24 @@ class Service:
         result_text = body.get("result")
         result_text = str(result_text) if result_text is not None else None
 
+        # EA v6.6 attaches the broker objects an execution produced so the ledger
+        # can be tied back to the position/deal that actually happened. Keep only
+        # the fields present in this ack; ``snapshot`` belongs to the account path
+        # handled above, not to a trade row.
+        result_extra = {
+            field: body[field]
+            for field in contract.RESULT_EXTRA_FIELDS
+            if field != "snapshot" and body.get(field) is not None
+        }
+
         superseded = row is not None and row["status"] == contract.STATUS_EXPIRED
-        self.store.record_result(request_id, status=status, retcode=retcode, result_text=result_text)
+        self.store.record_result(
+            request_id,
+            status=status,
+            retcode=retcode,
+            result_text=result_text,
+            result_extra=result_extra or None,
+        )
 
         detail: Dict[str, Any] = {
             "status": status,
@@ -608,6 +624,8 @@ class Service:
             "ea_timestamp": body.get("timestamp"),
             "known": row is not None,
         }
+        if result_extra:
+            detail["result_extra"] = result_extra
         if superseded:
             detail["superseded_expiry"] = True
         self.emit(events.SIGNAL_RESULT, request_id, detail)

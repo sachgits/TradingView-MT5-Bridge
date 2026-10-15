@@ -1,5 +1,5 @@
 //+---------------------------------------------------------------------+
-//| TradingView to MT5 Bridge - Trading Bot v6.4                         |
+//| TradingView to MT5 Bridge - Trading Bot v6.6                         |
 //| Universal command processor                                          |
 //|                                                                      |
 //| Wire protocol (bridge envelope):                                     |
@@ -41,6 +41,37 @@
 //|        and appends the same line to a local results log file.       |
 //| v6.4:  scenario & risk management: action aliases + new actions,    |
 //| v6.5:  account snapshot & pending-order engine.                     |
+//| v6.6:  trailing-stop action, cash-risk sizing, ticket targeting,    |
+//|        exact partial-close volume, order deviation/comment, and a   |
+//|        richer processed-result body.                               |
+//|   NEW MANAGEMENT ACTION:                                           |
+//|     {"action":"trailing","symbol":"EURUSD",                        |
+//|      "trailing":{"distance":50,"activation":20}}                   |
+//|     (aliases: trail, trailing_stop, update_trailing). Targets a    |
+//|     position by symbol+magic, or by "position_ticket". distance is |
+//|     the SL trail behind market; activation is the profit needed    |
+//|     before trailing arms. Both take the standard distance schema.  |
+//|   CASH-RISK SIZING:                                                |
+//|     "size":{"unit":"risk_money","value":150} risks 150 in account  |
+//|     currency, converted to lots from the stop_loss distance and    |
+//|     the symbol tick value (aliases: risk_cash, risk_amount,        |
+//|     risk_usd). Requires a stop_loss; the broker only accepts lots, |
+//|     so the conversion happens here before OrderSend.               |
+//|   TICKET TARGETING & EXACT VOLUME:                                 |
+//|     "position_ticket" (alias position_id) aims close_position,     |
+//|     modify, breakeven and partial_close at one position instead of |
+//|     every position on the symbol. partial_close accepts            |
+//|     "close_volume" (alias volume) for an exact lot size, which     |
+//|     takes priority over close_percent.                            |
+//|   ORDER METADATA: "deviation" (max slippage in points) and         |
+//|     "comment" are passed through to OrderSend.                     |
+//|   RICHER RESULT BODY: an execution ack now also carries            |
+//|     "position_ticket", "deal_ticket", "filled_price" and           |
+//|     "filled_volume" (alongside "order_ticket" for pendings), so    |
+//|     the bridge can reconcile a fill against the broker's objects.  |
+//|   NEW local guard retcode: -50 unparseable command or invalid      |
+//|     symbol, rejected locally before any OrderSend.                 |
+//|        (end of v6.6 notes; v6.5 pending/account detail below.)     |
 //|                                                                     |
 //|   NEW READ-ONLY ACTION (works even when trading is disabled):       |
 //|     {"action":"account"}   (aliases: status, snapshot, info)        |
@@ -245,7 +276,7 @@
 //   - Backtests do not prove live profitability; validate on a demo account.
 #property copyright "Copyright 2025"
 #property link      "https://github.com/sachgits/TradingView-MT5-Bridge"
-#property version   "6.5"
+#property version   "6.6"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -276,6 +307,10 @@ int lastTradeRetcode = 0;
 string lastTradeResult = "PROCESSED";
 string lastAccountSnapshot = "";   // v6.5: JSON body for "account" action
 ulong lastTradeOrderTicket = 0;    // v6.5: ticket of last placed order
+ulong lastTradePositionTicket = 0; // v6.6: ticket of opened/affected position
+ulong lastTradeDealTicket = 0;     // v6.6: ticket of execution deal
+double lastTradeFilledPrice = 0.0; // v6.6: execution fill price
+double lastTradeFilledVolume = 0.0;// v6.6: execution fill volume
 
 struct DistanceSpec
   {
@@ -292,7 +327,7 @@ struct TradeCommand
    string            symbol;
    double            size;
    string            sizeUnit;
-   double            riskPercent;
+   double            riskPercent; double riskMoney;   // riskMoney: cash risk in account currency (size unit "risk_money")
    DistanceSpec      stopLoss;
    DistanceSpec      takeProfit;
    bool              hasBreakeven;
@@ -312,6 +347,11 @@ struct TradeCommand
    string            expiration;     // "YYYY.MM.DD HH:MM" or ISO datetime
    bool              hasStopLoss;    // true when the payload really carried SL
    bool              hasTakeProfit;  // true when the payload really carried TP
+   //--- v6.6: expanded capabilities
+   ulong             positionTicket; // target position ticket for close/modify/breakeven/partial_close
+   double            closeVolume;    // exact lots for partial close
+   string            comment;        // order/deal comment
+   int               deviation;      // max slippage in points
   };
 
 //+------------------------------------------------------------------+
@@ -323,7 +363,7 @@ int OnInit()
 // Poll on a wall-clock timer so signals for ANY symbol are caught,
 // even on charts whose own symbol is quiet.
    EventSetTimer(MathMax(PollIntervalMs, 100));
-   Print("✅ TradingBridge v6.5 Started (universal symbol mode)");
+   Print("✅ TradingBridge v6.6 Started (universal symbol mode)");
    Print("📡 Monitoring: ", ServerURL);
    ClearOldSignalsOnStartup();
    return(INIT_SUCCEEDED);
@@ -422,6 +462,15 @@ void PollForSignals()
             Print("📊 Processing command: action=", cmd.action, " symbol=", cmd.symbol, " size=", cmd.size);
             lastProcessedSignal = signalJson;
             ExecuteTradeCommand(cmd);
+            ReportSignalResult(signalJson, cmd);
+           }
+         else
+           {
+            // R2 fix: acknowledge parse / symbol rejection so we do not loop endlessly every poll
+            Print("⚠️ Parse or symbol validation failed for signal. Acknowledging SKIPPED to prevent infinite loop.");
+            lastProcessedSignal = signalJson;
+            lastTradeRetcode = -50;
+            lastTradeResult = "SKIPPED: parse or symbol validation rejected";
             ReportSignalResult(signalJson, cmd);
            }
         }
@@ -536,6 +585,14 @@ void ReportSignalResult(string jsonText, TradeCommand &cmd)
 // when relevant so older consumers are not affected.
    if(lastTradeOrderTicket > 0)
       body += ",\"order_ticket\":" + IntegerToString(lastTradeOrderTicket);
+   if(lastTradePositionTicket > 0)
+      body += ",\"position_ticket\":" + IntegerToString(lastTradePositionTicket);
+   if(lastTradeDealTicket > 0)
+      body += ",\"deal_ticket\":" + IntegerToString(lastTradeDealTicket);
+   if(lastTradeFilledPrice > 0.0)
+      body += ",\"filled_price\":" + DoubleToString(lastTradeFilledPrice, 5);
+   if(lastTradeFilledVolume > 0.0)
+      body += ",\"filled_volume\":" + DoubleToString(lastTradeFilledVolume, 2);
    if(lastAccountSnapshot != "")
       body += ",\"snapshot\":" + lastAccountSnapshot;
    body += "}";
@@ -634,7 +691,8 @@ bool IsSignalStale(string jsonText, int maxAgeMinutes)
    if(sigStamp == "")
       return false; // cannot date it - never clear blindly
 
-   string nowStamp = TimeToString(TimeLocal(), TIME_DATE | TIME_SECONDS); // "YYYY.MM.DD HH:MM:SS"
+   datetime nowGmt = TimeGMT();
+   string nowStamp = TimeToString(nowGmt, TIME_DATE | TIME_SECONDS); // "YYYY.MM.DD HH:MM:SS" (UTC/GMT)
    string sigDate = StringSubstr(sigStamp, 0, 10);
    string nowDate = StringSubstr(nowStamp, 0, 10);
 
@@ -643,7 +701,7 @@ bool IsSignalStale(string jsonText, int maxAgeMinutes)
       return false;   // future-dated - do not touch
    if(dayCmp < 0)
      {
-      string yesterday = TimeToString(TimeLocal() - 86400, TIME_DATE);
+      string yesterday = TimeToString(nowGmt - 86400, TIME_DATE);
       if(sigDate == yesterday)
         {
          int ageMin = (StampToMinutes(nowStamp) + 1440) - StampToMinutes(sigStamp);
@@ -708,9 +766,9 @@ double NormalizeVolume(string symbol, double lot)
    double maxV = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
    if(step <= 0)
       step = 0.01;
-   if(lot <= 0 || minV > 0)
+   if(lot <= 0)
       lot = minV > 0 ? minV : lot;
-   lot = MathFloor(lot / step + 0.5) * step;
+   lot = MathFloor(MathMax(lot, minV) / step + 0.5) * step;
    if(maxV > 0 && lot > maxV)
       lot = maxV;
    return lot;
@@ -740,6 +798,14 @@ string NormalizeAction(string action)
       return "breakeven";
    if(a == "HOLD" || a == "HOLD_POSITION" || a == "NONE" || a == "NOOP" || a == "WAIT" || a == "TREND" || a == "WAIT_FOR")
       return "noop";
+   if(a == "TRAILING" || a == "TRAILING_STOP" || a == "TRAIL" || a == "UPDATE_TRAILING")
+      return "trailing";
+   if(a == "CLOSE_POSITIONS")
+      return "close_all";
+   if(a == "MODIFY_POSITION")
+      return "modify";
+   if(a == "CLOSE_PENDING")
+      return "cancel_pending";
 // v6.5: account snapshot and pending-order actions.
    if(a == "ACCOUNT" || a == "STATUS" || a == "SNAPSHOT" || a == "ACCOUNT_INFO" || a == "INFO")
       return "account";
@@ -773,7 +839,7 @@ bool ParseTradeCommand(string jsonText, TradeCommand &cmd)
    cmd.symbol = "";
    cmd.size = 0.0;
    cmd.sizeUnit = "lots";
-   cmd.riskPercent = DefaultRiskPercent;
+   cmd.riskPercent = DefaultRiskPercent; cmd.riskMoney = 0.0;
    cmd.stopLoss = BuildDistanceSpec("points", 0.0);
    cmd.takeProfit = BuildDistanceSpec("points", 0.0);
    cmd.hasBreakeven = false;
@@ -791,6 +857,10 @@ bool ParseTradeCommand(string jsonText, TradeCommand &cmd)
    cmd.expiration = "";
    cmd.hasStopLoss = false;
    cmd.hasTakeProfit = false;
+   cmd.positionTicket = 0;
+   cmd.closeVolume = 0.0;
+   cmd.comment = "";
+   cmd.deviation = 10;
 
 // The bridge wraps commands in "normalized"; raw top-level payloads
 // stay supported for backwards compatibility.
@@ -862,6 +932,10 @@ bool ParseTradeCommand(string jsonText, TradeCommand &cmd)
    if(cmd.size <= 0)
       cmd.size = JsonGetDouble(cmdObject, "value", 0.0);
    cmd.riskPercent = JsonGetDouble(cmdObject, "risk_percent", DefaultRiskPercent);
+   cmd.riskMoney = JsonGetDouble(cmdObject, "risk_money",
+                   JsonGetDouble(cmdObject, "risk_cash",
+                   JsonGetDouble(cmdObject, "risk_amount",
+                   JsonGetDouble(cmdObject, "risk_usd", 0.0))));
 
    cmd.stopLoss = ParseDistanceSpec(cmdObject, "stop_loss", "sl");
    cmd.takeProfit = ParseDistanceSpec(cmdObject, "take_profit", "tp");
@@ -903,9 +977,14 @@ bool ParseTradeCommand(string jsonText, TradeCommand &cmd)
    cmd.orderType = JsonGetString(cmdObject, "order_type");
    if(cmd.orderType == "")
       cmd.orderType = cmd.action;   // direct action aliases are canonical
-   cmd.price = JsonGetDouble(cmdObject, "price", 0.0);
-   if(cmd.price <= 0)
+
+   // R1 fix: do not treat negative price as missing when price is a signed points offset
+   bool hasPriceKey = (StringFind(cmdObject, "\"price\"") >= 0);
+   if(hasPriceKey)
+      cmd.price = JsonGetDouble(cmdObject, "price", 0.0);
+   else
       cmd.price = JsonGetDouble(cmdObject, "entry", 0.0);
+
    cmd.stopLimit = JsonGetDouble(cmdObject, "stoplimit", 0.0);
    if(cmd.stopLimit <= 0)
       cmd.stopLimit = JsonGetDouble(cmdObject, "stop_limit", 0.0);
@@ -926,6 +1005,24 @@ bool ParseTradeCommand(string jsonText, TradeCommand &cmd)
    cmd.hasTakeProfit = (StringFind(cmdObject, "\"take_profit\"") >= 0 ||
                         StringFind(cmdObject, "\"tp\"") >= 0 ||
                         StringFind(cmdObject, "\"tp_distance\"") >= 0);
+
+   // v6.6 additions: positionTicket, closeVolume, comment, deviation
+   cmd.positionTicket = (ulong)JsonGetDouble(cmdObject, "position_ticket", 0.0);
+   if(cmd.positionTicket <= 0)
+      cmd.positionTicket = (ulong)JsonGetDouble(cmdObject, "position_id", 0.0);
+   cmd.closeVolume = JsonGetDouble(cmdObject, "close_volume", 0.0);
+   if(cmd.closeVolume <= 0.0)
+      cmd.closeVolume = JsonGetDouble(cmdObject, "volume", 0.0);
+   cmd.comment = JsonGetString(cmdObject, "comment");
+   if(cmd.comment == "")
+      cmd.comment = JsonGetString(cmdObject, "strategy_id");
+   if(cmd.comment == "")
+      cmd.comment = JsonGetString(cmdObject, "client_tag");
+   if(cmd.comment == "")
+      cmd.comment = JsonGetString(cmdObject, "tag");
+   cmd.deviation = (int)JsonGetDouble(cmdObject, "deviation", 0.0);
+   if(cmd.deviation <= 0)
+      cmd.deviation = (int)JsonGetDouble(cmdObject, "slippage", 10.0);
    return true;
   }
 
@@ -954,7 +1051,7 @@ bool ParseLegacyCommand(string signalText, TradeCommand &cmd)
      }
    cmd.size = LotSize;
    cmd.sizeUnit = "lots";
-   cmd.riskPercent = DefaultRiskPercent;
+   cmd.riskPercent = DefaultRiskPercent; cmd.riskMoney = 0.0;
    cmd.stopLoss = BuildDistanceSpec("points", StopLossPoints);
    cmd.takeProfit = BuildDistanceSpec("points", TakeProfitPoints);
 
@@ -1105,10 +1202,10 @@ double RiskSizePosition(string symbol, TradeCommand &cmd, int slPoints)
       unit = "lots";
    double riskPct = (cmd.riskPercent > 0) ? cmd.riskPercent : DefaultRiskPercent;
    double lots = cmd.size;
-   if(unit == "risk")
+   bool isRiskMoney = (unit == "risk_money" || unit == "risk_cash" || unit == "risk_amount" || unit == "risk_usd"); if(unit == "risk" || isRiskMoney)
      {
       double lossPerLot = (slPoints > 0 && tickSize > 0) ? (slPoints * point / tickSize) * tickValue : 0.0;
-      lots = (lossPerLot > 0) ? (balance * riskPct / 100.0) / lossPerLot : LotSize;
+      double riskAmt = isRiskMoney ? (cmd.size > 0 ? cmd.size : cmd.riskMoney) : (balance * riskPct / 100.0); lots = (lossPerLot > 0 && riskAmt > 0) ? riskAmt / lossPerLot : LotSize;
      }
    if(unit == "percent")
       lots = (balance * (cmd.size > 0 ? cmd.size : riskPct) / 100.0) / (price * contract);
@@ -1152,6 +1249,11 @@ void ExecuteTradeCommand(TradeCommand &cmd)
    lastTradeResult = "PROCESSED";
    lastAccountSnapshot = "";
    lastTradeOrderTicket = 0;
+   lastTradePositionTicket = 0;
+   lastTradeDealTicket = 0;
+   lastTradeFilledPrice = 0.0;
+   lastTradeFilledVolume = 0.0;
+
 // v6.5: read-only account snapshot - works even when trading is disabled
 // or the market is closed (pure state query, never submits an order).
    if(cmd.action == "account")
@@ -1163,6 +1265,16 @@ void ExecuteTradeCommand(TradeCommand &cmd)
             " positions=", PositionsTotal(), " pending=", OrdersTotal());
       return;
      }
+
+// R5 fix: noop acknowledged even when offline or trading disabled
+   if(cmd.action == "noop")
+     {
+      lastTradeRetcode = 0;
+      lastTradeResult = "NOOP";
+      Print("ℹ️ No-op signal acknowledged (symbol=", cmd.symbol, ")");
+      return;
+     }
+
    if(!TerminalInfoInteger(TERMINAL_CONNECTED))
      {
       lastTradeRetcode = -10;
@@ -1197,8 +1309,7 @@ void ExecuteTradeCommand(TradeCommand &cmd)
      }
    if(cmd.action == "close_position" || cmd.action == "close_symbol")
      {
-      ClosePositionByMagicAndSymbol(cmd.symbol, MagicNumber);
-      lastTradeResult = "CLOSED " + cmd.symbol;
+      ClosePositionByMagicAndSymbol(cmd.symbol, MagicNumber, cmd.positionTicket);
       return;
      }
    if(cmd.action == "close_all")
@@ -1221,11 +1332,9 @@ void ExecuteTradeCommand(TradeCommand &cmd)
       MoveToBreakeven(cmd);
       return;
      }
-   if(cmd.action == "noop")
+   if(cmd.action == "trailing")
      {
-      lastTradeRetcode = 0;
-      lastTradeResult = "NOOP";
-      Print("ℹ️ No-op signal acknowledged (symbol=", cmd.symbol, ")");
+      ApplyTrailingStop(cmd);
       return;
      }
 // v6.5: pending-order engine (place / cancel / modify).
@@ -1279,17 +1388,31 @@ void OpenBuyOrder(string symbol, TradeCommand &cmd)
    double slPrice = ask - slPoints * point;
    double tpPrice = ask + tpPoints * point;
 
-   if(trade.Buy(lot, symbol, ask, slPrice, tpPrice, "BUY"))
+   if(cmd.deviation > 0)
+      trade.SetDeviationInPoints(cmd.deviation);
+   else
+      trade.SetDeviationInPoints(10);
+   string cmt = (cmd.comment != "") ? cmd.comment : "BUY";
+
+   if(trade.Buy(lot, symbol, ask, slPrice, tpPrice, cmt))
      {
       lastTradeRetcode = 0;
       lastTradeResult = "BUY OPENED";
-      Print("✅ BUY OPENED | symbol=", symbol, " lot=", lot, " sl=", slPoints, " tp=", tpPoints);
+      lastTradeOrderTicket = trade.ResultOrder();
+      lastTradeDealTicket = trade.ResultDeal();
+      lastTradeFilledPrice = trade.ResultPrice();
+      lastTradeFilledVolume = trade.ResultVolume();
+      if(HistoryDealSelect(lastTradeDealTicket))
+         lastTradePositionTicket = (ulong)HistoryDealGetInteger(lastTradeDealTicket, DEAL_POSITION_ID);
+      if(lastTradePositionTicket <= 0)
+         lastTradePositionTicket = lastTradeOrderTicket;
+      Print("✅ BUY OPENED | symbol=", symbol, " lot=", lot, " ticket=", lastTradePositionTicket, " deal=", lastTradeDealTicket, " price=", lastTradeFilledPrice);
      }
    else
      {
       lastTradeRetcode = (int)trade.ResultRetcode();
       lastTradeResult = "BUY FAILED";
-      Print("❌ BUY FAILED: ", trade.ResultRetcode());
+      Print("❌ BUY FAILED: ", trade.ResultRetcode(), " ", trade.ResultComment());
      }
   }
 
@@ -1320,17 +1443,31 @@ void OpenSellOrder(string symbol, TradeCommand &cmd)
    double slPrice = bid + slPoints * point;
    double tpPrice = bid - tpPoints * point;
 
-   if(trade.Sell(lot, symbol, bid, slPrice, tpPrice, "SELL"))
+   if(cmd.deviation > 0)
+      trade.SetDeviationInPoints(cmd.deviation);
+   else
+      trade.SetDeviationInPoints(10);
+   string cmt = (cmd.comment != "") ? cmd.comment : "SELL";
+
+   if(trade.Sell(lot, symbol, bid, slPrice, tpPrice, cmt))
      {
       lastTradeRetcode = 0;
       lastTradeResult = "SELL OPENED";
-      Print("✅ SELL OPENED | symbol=", symbol, " lot=", lot, " sl=", slPoints, " tp=", tpPoints);
+      lastTradeOrderTicket = trade.ResultOrder();
+      lastTradeDealTicket = trade.ResultDeal();
+      lastTradeFilledPrice = trade.ResultPrice();
+      lastTradeFilledVolume = trade.ResultVolume();
+      if(HistoryDealSelect(lastTradeDealTicket))
+         lastTradePositionTicket = (ulong)HistoryDealGetInteger(lastTradeDealTicket, DEAL_POSITION_ID);
+      if(lastTradePositionTicket <= 0)
+         lastTradePositionTicket = lastTradeOrderTicket;
+      Print("✅ SELL OPENED | symbol=", symbol, " lot=", lot, " ticket=", lastTradePositionTicket, " deal=", lastTradeDealTicket, " price=", lastTradeFilledPrice);
      }
    else
      {
       lastTradeRetcode = (int)trade.ResultRetcode();
       lastTradeResult = "SELL FAILED";
-      Print("❌ SELL FAILED: ", trade.ResultRetcode());
+      Print("❌ SELL FAILED: ", trade.ResultRetcode(), " ", trade.ResultComment());
      }
   }
 
@@ -1340,18 +1477,34 @@ void OpenSellOrder(string symbol, TradeCommand &cmd)
 void CloseAllPositions()
   {
    int closed = 0;
+   int failed = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
         {
-         trade.PositionClose(ticket);
-         closed++;
+         if(trade.PositionClose(ticket))
+            closed++;
+         else
+            failed++;
         }
      }
-   lastTradeRetcode = 0;
-   lastTradeResult = "CLOSED ALL (" + IntegerToString(closed) + ")";
-   Print("✅ Close-all executed, positions closed: ", closed);
+   if(closed > 0)
+     {
+      lastTradeRetcode = 0;
+      lastTradeResult = "CLOSED " + IntegerToString(closed) + " POSITIONS";
+     }
+   else if(failed > 0)
+     {
+      lastTradeRetcode = (int)trade.ResultRetcode();
+      lastTradeResult = "CLOSE ALL FAILED";
+     }
+   else
+     {
+      lastTradeRetcode = 0;
+      lastTradeResult = "NO POSITIONS TO CLOSE";
+     }
+   Print("✅ Closed positions: ", closed, " failed=", failed);
   }
 
 //+------------------------------------------------------------------+
@@ -1367,16 +1520,30 @@ void PartialClosePosition(TradeCommand &cmd)
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) &&
-         PositionGetString(POSITION_SYMBOL) == cmd.symbol &&
-         PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      if(PositionSelectByTicket(ticket))
         {
-         double vol = PositionGetDouble(POSITION_VOLUME) * percent / 100.0;
-         vol = NormalizeVolume(cmd.symbol, vol);
-         trade.PositionClosePartial(ticket, vol);
-         lastTradeRetcode = 0;
-         lastTradeResult = "PARTIAL CLOSED " + IntegerToString(percent) + "%";
-         Print("✅ Partial close ", percent, "% ", cmd.symbol);
+         if(cmd.positionTicket > 0)
+           {
+            if(ticket != cmd.positionTicket)
+               continue;
+           }
+         else
+           {
+            if(PositionGetString(POSITION_SYMBOL) != cmd.symbol || PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+               continue;
+           }
+         string posSym = PositionGetString(POSITION_SYMBOL);
+         double posVol = PositionGetDouble(POSITION_VOLUME);
+         double vol = (cmd.closeVolume > 0.0) ? cmd.closeVolume : (posVol * percent / 100.0);
+         vol = NormalizeVolume(posSym, vol);
+         if(vol > posVol)
+            vol = posVol;
+         bool pcOk = trade.PositionClosePartial(ticket, vol);
+         lastTradeRetcode = pcOk ? 0 : (int)trade.ResultRetcode();
+         lastTradePositionTicket = ticket;
+         lastTradeFilledVolume = vol;
+         lastTradeResult = pcOk ? ("PARTIAL CLOSED ticket=" + IntegerToString(ticket) + " vol=" + DoubleToString(vol, 2)) : "PARTIAL CLOSE FAILED";
+         Print("✅ Partial close ", vol, " lots on ticket=", ticket, " (", posSym, ")");
          return;
         }
      }
@@ -1393,15 +1560,25 @@ void ModifyPosition(TradeCommand &cmd)
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) &&
-         PositionGetString(POSITION_SYMBOL) == cmd.symbol &&
-         PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      if(PositionSelectByTicket(ticket))
         {
+         if(cmd.positionTicket > 0)
+           {
+            if(ticket != cmd.positionTicket)
+               continue;
+           }
+         else
+           {
+            if(PositionGetString(POSITION_SYMBOL) != cmd.symbol || PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+               continue;
+           }
+         string posSym = PositionGetString(POSITION_SYMBOL);
          double open = PositionGetDouble(POSITION_PRICE_OPEN);
-         double point = SymbolInfoDouble(cmd.symbol, SYMBOL_POINT);
-         int slPts = ResolveDistanceToPoints(cmd.symbol, cmd.stopLoss);
-         int tpPts = ResolveDistanceToPoints(cmd.symbol, cmd.takeProfit);
-         double sl = 0, tp = 0;
+         double point = SymbolInfoDouble(posSym, SYMBOL_POINT);
+         int slPts = cmd.hasStopLoss ? ResolveDistanceToPoints(posSym, cmd.stopLoss) : 0;
+         int tpPts = cmd.hasTakeProfit ? ResolveDistanceToPoints(posSym, cmd.takeProfit) : 0;
+         double sl = PositionGetDouble(POSITION_SL);
+         double tp = PositionGetDouble(POSITION_TP);
          long ptype = PositionGetInteger(POSITION_TYPE);
          if(ptype == POSITION_TYPE_BUY)
            {
@@ -1417,10 +1594,13 @@ void ModifyPosition(TradeCommand &cmd)
             if(tpPts > 0)
                tp = open - tpPts * point;
            }
-         trade.PositionModify(ticket, sl, tp);
-         lastTradeRetcode = 0;
-         lastTradeResult = "MODIFIED " + cmd.symbol;
-         Print("✅ SL/TP modified: ", cmd.symbol, " sl=", slPts, " tp=", tpPts);
+         sl = NormalizePrice(posSym, sl);
+         tp = NormalizePrice(posSym, tp);
+         bool modOk = trade.PositionModify(ticket, sl, tp);
+         lastTradeRetcode = modOk ? 0 : (int)trade.ResultRetcode();
+         lastTradePositionTicket = ticket;
+         lastTradeResult = modOk ? ("MODIFIED ticket=" + IntegerToString(ticket)) : "MODIFY FAILED";
+         Print("✅ SL/TP modified ticket=", ticket, " sl=", sl, " tp=", tp);
          return;
         }
      }
@@ -1437,19 +1617,48 @@ void MoveToBreakeven(TradeCommand &cmd)
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) &&
-         PositionGetString(POSITION_SYMBOL) == cmd.symbol &&
-         PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      if(PositionSelectByTicket(ticket))
         {
+         if(cmd.positionTicket > 0)
+           {
+            if(ticket != cmd.positionTicket)
+               continue;
+           }
+         else
+           {
+            if(PositionGetString(POSITION_SYMBOL) != cmd.symbol || PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+               continue;
+           }
+         string posSym = PositionGetString(POSITION_SYMBOL);
          double open = PositionGetDouble(POSITION_PRICE_OPEN);
-         double point = SymbolInfoDouble(cmd.symbol, SYMBOL_POINT);
-         int lockPts = (cmd.breakevenLockIn.value > 0) ? (int)MathRound(cmd.breakevenLockIn.value) : 10;
+         double point = SymbolInfoDouble(posSym, SYMBOL_POINT);
          long ptype = PositionGetInteger(POSITION_TYPE);
+         double currentPrice = (ptype == POSITION_TYPE_BUY) ? SymbolInfoDouble(posSym, SYMBOL_BID) : SymbolInfoDouble(posSym, SYMBOL_ASK);
+
+         // Breakeven trigger enforcement
+         if(cmd.hasBreakeven && cmd.breakevenTrigger.value > 0.0)
+           {
+            int triggerPts = ResolveDistanceToPoints(posSym, cmd.breakevenTrigger);
+            double requiredPrice = (ptype == POSITION_TYPE_BUY) ? open + triggerPts * point : open - triggerPts * point;
+            bool triggerReached = (ptype == POSITION_TYPE_BUY) ? (currentPrice >= requiredPrice) : (currentPrice <= requiredPrice);
+            if(!triggerReached)
+              {
+               lastTradeRetcode = -32;
+               lastTradeResult = "FAILED: breakeven trigger not reached (need " + IntegerToString(triggerPts) + " pts)";
+               Print("⚠️ Breakeven trigger not reached for ticket=", ticket, " (current=", currentPrice, ", need=", requiredPrice, ")");
+               return;
+              }
+           }
+
+         int lockPts = (cmd.breakevenLockIn.value > 0) ? (int)MathRound(cmd.breakevenLockIn.value) : 10;
+         double tp = PositionGetDouble(POSITION_TP);
          double sl = (ptype == POSITION_TYPE_BUY) ? open + lockPts * point : open - lockPts * point;
-         trade.PositionModify(ticket, sl, 0);
-         lastTradeRetcode = 0;
-         lastTradeResult = "BREAKEVEN SET " + cmd.symbol;
-         Print("✅ Breakeven set: ", cmd.symbol, " lock_in=", lockPts, " pts");
+         sl = NormalizePrice(posSym, sl);
+         bool beOk = trade.PositionModify(ticket, sl, tp);
+         lastTradeRetcode = beOk ? 0 : (int)trade.ResultRetcode();
+         lastTradePositionTicket = ticket;
+         lastTradeResult = beOk ? ("BREAKEVEN SET ticket=" + IntegerToString(ticket)) : "BREAKEVEN FAILED";
+         Print("✅ Breakeven set ticket=", ticket, " lock_in=", lockPts, " pts");
          return;
         }
      }
@@ -1459,19 +1668,157 @@ void MoveToBreakeven(TradeCommand &cmd)
   }
 
 //+------------------------------------------------------------------+
-//|                                                                  |
+//| ApplyTrailingStop: moves SL to lock in profit behind market      |
 //+------------------------------------------------------------------+
-void ClosePositionByMagicAndSymbol(string symbol, int magic)
+void ApplyTrailingStop(TradeCommand &cmd)
   {
+   int modifiedCount = 0;
+   int matchedCount = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) &&
-         PositionGetString(POSITION_SYMBOL) == symbol &&
-         PositionGetInteger(POSITION_MAGIC) == magic)
+      if(PositionSelectByTicket(ticket))
         {
-         trade.PositionClose(ticket);
+         if(cmd.positionTicket > 0)
+           {
+            if(ticket != cmd.positionTicket)
+               continue;
+           }
+         else
+           {
+            if(PositionGetString(POSITION_SYMBOL) != cmd.symbol || PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+               continue;
+           }
+         matchedCount++;
+         string posSym = PositionGetString(POSITION_SYMBOL);
+         double open = PositionGetDouble(POSITION_PRICE_OPEN);
+         double curSl = PositionGetDouble(POSITION_SL);
+         double curTp = PositionGetDouble(POSITION_TP);
+         double point = SymbolInfoDouble(posSym, SYMBOL_POINT);
+         long ptype = PositionGetInteger(POSITION_TYPE);
+         double bid = SymbolInfoDouble(posSym, SYMBOL_BID);
+         double ask = SymbolInfoDouble(posSym, SYMBOL_ASK);
+
+         int trailDistPts = (cmd.hasTrailing && cmd.trailingDistance.value > 0.0) ? 
+                            ResolveDistanceToPoints(posSym, cmd.trailingDistance) : 60;
+         int actPts = (cmd.hasTrailing && cmd.trailingActivation.value > 0.0) ? 
+                      ResolveDistanceToPoints(posSym, cmd.trailingActivation) : 0;
+
+         if(ptype == POSITION_TYPE_BUY)
+           {
+            double profitPts = (bid - open) / point;
+            if(actPts > 0 && profitPts < actPts)
+              {
+               Print("ℹ️ Trailing activation not reached for buy ticket=", ticket, " (profit=", profitPts, ", need=", actPts, ")");
+               continue;
+              }
+            double newSl = bid - trailDistPts * point;
+            newSl = NormalizePrice(posSym, newSl);
+            if(newSl > curSl && newSl < bid)
+              {
+               if(trade.PositionModify(ticket, newSl, curTp))
+                 {
+                  modifiedCount++;
+                  lastTradePositionTicket = ticket;
+                  Print("✅ Trailing stop updated for buy ticket=", ticket, " newSl=", newSl);
+                 }
+              }
+           }
+         else // SELL
+           {
+            double profitPts = (open - ask) / point;
+            if(actPts > 0 && profitPts < actPts)
+              {
+               Print("ℹ️ Trailing activation not reached for sell ticket=", ticket, " (profit=", profitPts, ", need=", actPts, ")");
+               continue;
+              }
+            double newSl = ask + trailDistPts * point;
+            newSl = NormalizePrice(posSym, newSl);
+            if((curSl == 0.0 || newSl < curSl) && newSl > ask)
+              {
+               if(trade.PositionModify(ticket, newSl, curTp))
+                 {
+                  modifiedCount++;
+                  lastTradePositionTicket = ticket;
+                  Print("✅ Trailing stop updated for sell ticket=", ticket, " newSl=", newSl);
+                 }
+              }
+           }
         }
+     }
+   if(matchedCount == 0)
+     {
+      lastTradeRetcode = -31;
+      lastTradeResult = "FAILED: no position found for trailing stop";
+      Print("⚠️ No position found for trailing stop: ", cmd.symbol);
+     }
+   else if(modifiedCount > 0)
+     {
+      lastTradeRetcode = 0;
+      lastTradeResult = "TRAILING APPLIED (" + IntegerToString(modifiedCount) + " positions)";
+     }
+   else
+     {
+      lastTradeRetcode = 0;
+      lastTradeResult = "TRAILING UNCHANGED (no SL adjustment needed)";
+      Print("ℹ️ Trailing stop checked: no SL modification needed for ", cmd.symbol);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void ClosePositionByMagicAndSymbol(string symbol, int magic, ulong targetTicket = 0)
+  {
+   int closed = 0;
+   int failed = 0;
+   bool allSymbols = (symbol == "*");
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+        {
+         if(targetTicket > 0)
+           {
+            if(ticket != targetTicket)
+               continue;
+           }
+         else
+           {
+            if(!allSymbols && PositionGetString(POSITION_SYMBOL) != symbol)
+               continue;
+            if(PositionGetInteger(POSITION_MAGIC) != magic)
+               continue;
+           }
+         if(trade.PositionClose(ticket))
+           {
+            closed++;
+            lastTradePositionTicket = ticket;
+           }
+         else
+           {
+            failed++;
+           }
+        }
+     }
+   if(closed > 0)
+     {
+      lastTradeRetcode = 0;
+      lastTradeResult = (targetTicket > 0) ? ("CLOSED ticket=" + IntegerToString(targetTicket)) :
+                        ("CLOSED " + IntegerToString(closed) + " POSITIONS (" + symbol + ")");
+      Print("✅ Closed ", closed, " positions (symbol=", symbol, ")");
+     }
+   else if(failed > 0)
+     {
+      lastTradeRetcode = (int)trade.ResultRetcode();
+      lastTradeResult = "CLOSE FAILED";
+      Print("❌ Close failed: ", trade.ResultRetcode(), " ", trade.ResultComment());
+     }
+   else
+     {
+      lastTradeRetcode = -30;
+      lastTradeResult = "FAILED: no position to close";
+      Print("⚠️ No position to close for symbol=", symbol, " ticket=", targetTicket);
      }
   }
 
@@ -1784,23 +2131,9 @@ void PlacePendingOrder(TradeCommand &cmd)
       return;
      }
    double price = cmd.price;
-   if(price <= 0.0)
-     {
-      lastTradeRetcode = -40;
-      lastTradeResult = "SKIPPED: price required";
-      Print("⚠️ Pending order needs a price field.");
-      return;
-     }
    double stopLimit = cmd.stopLimit;
-   if((isBuySL || isSellSL) && stopLimit <= 0.0)
-     {
-      lastTradeRetcode = -40;
-      lastTradeResult = "SKIPPED: stoplimit required";
-      Print("⚠️ Stop-limit order needs a stoplimit field.");
-      return;
-     }
-// "price_unit":"points"/"distance" -> price is a signed offset from the
-// current market (+above / -below); buy measures from Ask, sell from Bid.
+// R1 fix: "price_unit":"points"/"distance" -> price is a signed offset from the
+// current market (+above / -below); compute absolute price before validating price > 0.
    bool priceInPoints = (cmd.priceUnit == "points" || cmd.priceUnit == "distance");
    if(priceInPoints)
      {
@@ -1808,6 +2141,67 @@ void PlacePendingOrder(TradeCommand &cmd)
       if(stopLimit > 0.0)
          stopLimit = base + stopLimit * point;
      }
+
+   if(price <= 0.0)
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: price required";
+      Print("⚠️ Pending order needs a price field.");
+      return;
+     }
+
+   // R3 fix: validate order price side against current market
+   if(isBuyStop && price <= ask)
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: buy_stop price must be above Ask";
+      Print("⚠️ buy_stop price ", price, " is not above Ask ", ask);
+      return;
+     }
+   if(isSellStop && price >= bid)
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: sell_stop price must be below Bid";
+      Print("⚠️ sell_stop price ", price, " is not below Bid ", bid);
+      return;
+     }
+   if(isBuyLimit && price >= ask)
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: buy_limit price must be below Ask";
+      Print("⚠️ buy_limit price ", price, " is not below Ask ", ask);
+      return;
+     }
+   if(isSellLimit && price <= bid)
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: sell_limit price must be above Bid";
+      Print("⚠️ sell_limit price ", price, " is not above Bid ", bid);
+      return;
+     }
+   if(isBuySL && price <= ask)
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: buy_stop_limit price must be above Ask";
+      Print("⚠️ buy_stop_limit price ", price, " is not above Ask ", ask);
+      return;
+     }
+   if(isSellSL && price >= bid)
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: sell_stop_limit price must be below Bid";
+      Print("⚠️ sell_stop_limit price ", price, " is not below Bid ", bid);
+      return;
+     }
+
+   if((isBuySL || isSellSL) && stopLimit <= 0.0)
+     {
+      lastTradeRetcode = -40;
+      lastTradeResult = "SKIPPED: stoplimit required";
+      Print("⚠️ Stop-limit order needs a stoplimit field.");
+      return;
+     }
+
    price = NormalizePrice(cmd.symbol, price);
    if(stopLimit > 0.0)
       stopLimit = NormalizePrice(cmd.symbol, stopLimit);
@@ -1842,23 +2236,25 @@ void PlacePendingOrder(TradeCommand &cmd)
       typeTime = ORDER_TIME_SPECIFIED;
      }
 
+   if(cmd.deviation > 0)
+      trade.SetDeviationInPoints(cmd.deviation);
+   else
+      trade.SetDeviationInPoints(10);
+   string cmt = (cmd.comment != "") ? cmd.comment : (isBuySL ? "PENDING_BUY_STOP_LIMIT" : (isSellSL ? "PENDING_SELL_STOP_LIMIT" : typeName));
+
    bool ok = false;
    if(isBuyLimit)
-      ok = trade.BuyLimit(lot, price, cmd.symbol, sl, tp, typeTime, expiration, "PENDING_BUY_LIMIT");
+      ok = trade.BuyLimit(lot, price, cmd.symbol, sl, tp, typeTime, expiration, cmt);
+   else if(isSellLimit)
+      ok = trade.SellLimit(lot, price, cmd.symbol, sl, tp, typeTime, expiration, cmt);
+   else if(isBuyStop)
+      ok = trade.BuyStop(lot, price, cmd.symbol, sl, tp, typeTime, expiration, cmt);
+   else if(isSellStop)
+      ok = trade.SellStop(lot, price, cmd.symbol, sl, tp, typeTime, expiration, cmt);
    else
-      if(isSellLimit)
-         ok = trade.SellLimit(lot, price, cmd.symbol, sl, tp, typeTime, expiration, "PENDING_SELL_LIMIT");
-      else
-         if(isBuyStop)
-            ok = trade.BuyStop(lot, price, cmd.symbol, sl, tp, typeTime, expiration, "PENDING_BUY_STOP");
-         else
-            if(isSellStop)
-               ok = trade.SellStop(lot, price, cmd.symbol, sl, tp, typeTime, expiration, "PENDING_SELL_STOP");
-            else
-               ok = trade.OrderOpen(cmd.symbol,
-                                    isBuySL ? ORDER_TYPE_BUY_STOP_LIMIT : ORDER_TYPE_SELL_STOP_LIMIT,
-                                    lot, stopLimit, price, sl, tp, typeTime, expiration,
-                                    isBuySL ? "PENDING_BUY_STOP_LIMIT" : "PENDING_SELL_STOP_LIMIT");
+      ok = trade.OrderOpen(cmd.symbol,
+                           isBuySL ? ORDER_TYPE_BUY_STOP_LIMIT : ORDER_TYPE_SELL_STOP_LIMIT,
+                           lot, stopLimit, price, sl, tp, typeTime, expiration, cmt);
 
    if(ok)
      {
@@ -1904,7 +2300,7 @@ void CancelPendingOrder(TradeCommand &cmd)
       if(trade.OrderDelete(cmd.orderTicket))
         {
          lastTradeRetcode = 0;
-         lastTradeResult = "ORDER CANCELED ticket=" + IntegerToString(cmd.orderTicket);
+         lastTradeOrderTicket = cmd.orderTicket; lastTradeResult = "ORDER CANCELED ticket=" + IntegerToString(cmd.orderTicket);
          Print("✅ Pending order canceled: ", cmd.orderTicket);
         }
       else
@@ -1978,6 +2374,8 @@ void ModifyPendingOrder(TradeCommand &cmd)
       return;
      }
    long otype = OrderGetInteger(ORDER_TYPE);
+   // R4 fix: resolve symbol directly from the order rather than relying on cmd.symbol
+   string orderSymbol = OrderGetString(ORDER_SYMBOL);
    bool isBuy = (otype == ORDER_TYPE_BUY_LIMIT || otype == ORDER_TYPE_BUY_STOP ||
                  otype == ORDER_TYPE_BUY_STOP_LIMIT);
    double curPrice = OrderGetDouble(ORDER_PRICE_OPEN);
@@ -1985,27 +2383,27 @@ void ModifyPendingOrder(TradeCommand &cmd)
    double curTp = OrderGetDouble(ORDER_TP);
    double curStopLimit = OrderGetDouble(ORDER_PRICE_STOPLIMIT);
    datetime curExp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
-   double point = SymbolInfoDouble(cmd.symbol, SYMBOL_POINT);
+   double point = SymbolInfoDouble(orderSymbol, SYMBOL_POINT);
 
-   double newPrice = (cmd.price > 0.0) ? NormalizePrice(cmd.symbol, cmd.price) : curPrice;
+   double newPrice = (cmd.price > 0.0) ? NormalizePrice(orderSymbol, cmd.price) : curPrice;
    double newSl = curSl;
    double newTp = curTp;
    if(cmd.hasStopLoss)
      {
-      int pts = ResolveDistanceToPoints(cmd.symbol, cmd.stopLoss);
+      int pts = ResolveDistanceToPoints(orderSymbol, cmd.stopLoss);
       if(pts > 0 && pts < MinStopDistancePoints)
          pts = MinStopDistancePoints;
       newSl = (pts > 0) ? (isBuy ? newPrice - pts * point : newPrice + pts * point) : 0.0;
      }
    if(cmd.hasTakeProfit)
      {
-      int pts = ResolveDistanceToPoints(cmd.symbol, cmd.takeProfit);
+      int pts = ResolveDistanceToPoints(orderSymbol, cmd.takeProfit);
       if(pts > 0 && pts < MinStopDistancePoints)
          pts = MinStopDistancePoints;
       newTp = (pts > 0) ? (isBuy ? newPrice + pts * point : newPrice - pts * point) : 0.0;
      }
-   newSl = NormalizePrice(cmd.symbol, newSl);
-   newTp = NormalizePrice(cmd.symbol, newTp);
+   newSl = NormalizePrice(orderSymbol, newSl);
+   newTp = NormalizePrice(orderSymbol, newTp);
    datetime newExp = curExp;
    ENUM_ORDER_TYPE_TIME typeTime = (newExp > 0) ? ORDER_TIME_SPECIFIED : ORDER_TIME_GTC;
    if(cmd.expiration != "")
@@ -2043,10 +2441,10 @@ void ModifyPendingOrder(TradeCommand &cmd)
 //+------------------------------------------------------------------+
 double GetAtrValue(int handle)
   {
-   double atrBuffer[];
+   double atrBuffer[]; for(int w = 0; w < 10 && BarsCalculated(handle) < 2; w++) Sleep(20);
    ArraySetAsSeries(atrBuffer, true);
    double value = 0.0;
-   if(CopyBuffer(handle, 0, 0, 1, atrBuffer) > 0)
+   if(CopyBuffer(handle, 0, 1, 1, atrBuffer) > 0)
       value = atrBuffer[0];
    IndicatorRelease(handle);
    if(value > 0 && value != EMPTY_VALUE)

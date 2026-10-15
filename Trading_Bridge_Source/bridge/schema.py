@@ -71,6 +71,9 @@ _KNOWN_PASSTHROUGH = (
     "price_unit",
     "stoplimit",
     "order_ticket",
+    # EA v6.6 additions.
+    "close_volume",
+    "deviation",
 )
 
 
@@ -202,15 +205,23 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             if key in block:
                 block[key] = normalize_distance(block[key])
 
-    # --- pending-order engine fields (EA v6.5) -----------------------------
+    # --- pending-order & position management fields (EA v6.5 / v6.6) --------
     # Fold each sender alias onto the canonical key the EA reads, drop the
     # alias, and canonicalize order_type/price_unit so validation and dedup see
     # one stable spelling. Only touches keys the sender actually supplied - a
     # market order carries none of these and gains none.
     _fold_alias(result, "price", contract.PRICE_ALIASES)
     _fold_alias(result, "stoplimit", contract.STOPLIMIT_ALIASES)
-    _fold_alias(result, "order_ticket", contract.ORDER_TICKET_ALIASES, integer=True)
+    if canonical in (contract.MANAGEMENT_ACTIONS | {"close_position"}):
+        _fold_alias(result, "position_ticket", ("position_ticket", "ticket"), integer=True)
+        _fold_alias(result, "order_ticket", ("order_ticket",), integer=True)
+    else:
+        _fold_alias(result, "order_ticket", contract.ORDER_TICKET_ALIASES, integer=True)
+        _fold_alias(result, "position_ticket", ("position_ticket",), integer=True)
+    _fold_alias(result, "deviation", ("deviation", "slippage"), integer=True)
     _fold_alias(result, "expiration", contract.EXPIRATION_ALIASES)
+    if "close_volume" in result:
+        result["close_volume"] = _coerce_numeric(result["close_volume"])
     if result.get("order_type") is not None:
         result["order_type"] = contract.normalize_action(result["order_type"])
     if result.get("price_unit") is not None:

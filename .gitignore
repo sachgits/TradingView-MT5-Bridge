@@ -6,6 +6,9 @@ build/
 *.spec
 TradingBridge-Universal.zip
 
+# MetaEditor CLI build logs, regenerated on every compile
+compile.log
+
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm

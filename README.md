@@ -183,6 +183,7 @@ powershell -File build.ps1                          # PyInstaller onefile + dist
 ## 📚 Documentation
 
 - [INSTALL_AND_TEST_GUIDE.md](INSTALL_AND_TEST_GUIDE.md) - setup and end-to-end test procedure
+- [INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md) - **for signal producers**: every capability with examples from simple to complex, transports, idempotency, reading results back
 - [FILE_IO_GUIDE.md](FILE_IO_GUIDE.md) - folder intake, file markings, examples
 - [AUDIT_AND_COMMANDS.md](AUDIT_AND_COMMANDS.md) - command schema, ledger fields, endpoints
 - [TEST_MATRIX.md](TEST_MATRIX.md) - the behaviours the test suite pins down

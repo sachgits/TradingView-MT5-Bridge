@@ -615,6 +615,29 @@ async function openDrawer(requestId) {
   }
   body.appendChild(list);
 
+  // EA v6.6 ties an execution back to the broker objects it produced, so a
+  // filled order can be reconciled against the terminal rather than trusted on
+  // a "SUCCESS" string alone. Rendered only when the ack actually carried them.
+  const extra = signal.result_extra;
+  if (extra && typeof extra === "object" && Object.keys(extra).length) {
+    const labels = {
+      order_ticket: "Order ticket",
+      position_ticket: "Position ticket",
+      deal_ticket: "Deal ticket",
+      filled_price: "Fill price",
+      filled_volume: "Fill volume",
+    };
+    body.appendChild(h("h2", { class: "subhead", text: "Broker objects" }));
+    const extraList = h("div", { class: "stat-list" });
+    for (const [key, value] of Object.entries(extra)) {
+      if (value === null || value === undefined) continue;
+      extraList.appendChild(h("div", { class: "stat-row" },
+        h("span", { text: labels[key] || key }),
+        h("span", { class: "mono", text: String(value) })));
+    }
+    body.appendChild(extraList);
+  }
+
   const actions = h("div", { class: "row" });
   const canCancel = signal.status === "queued";
   const canRetry = !["queued", "dispatched"].includes(signal.status);
